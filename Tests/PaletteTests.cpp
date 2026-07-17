@@ -162,11 +162,28 @@ auto tDeadPagesSinkBelowSearch =
 };
 
 auto tURLQueryPrefersTheExactItem =
-    test("Palette/a URL query picks the exactly-matching item first") = []
+    test("Palette/a URL query's exact match replaces the search row") = []
 {
     auto all = mergePaletteItems(someTabs(), somePlaces(), lastUsedFrom({}));
     auto ranked = rankPalette(all, {}, "github.com");
 
     check(ranked.front().tabId == 0);
-    check(ranked.back().isSearch);
+
+    for (auto& item: ranked)
+        check(!item.isSearch);
+};
+
+auto tSearchRowNeverDuplicated =
+    test("Palette/a past search of the same query yields one row, not two") = []
+{
+    auto history =
+        std::vector<HistoryEntry> {{"https://www.google.com/search?q=hacker+news",
+                                    "hacker news - Google Search",
+                                    100,
+                                    1}};
+
+    auto ranked = rankPalette({}, history, "hacker news");
+
+    check(ranked.size() == 1);
+    check(ranked.front().isSearch);
 };

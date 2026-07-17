@@ -103,9 +103,10 @@ std::vector<GoItem> rankPalette(const std::vector<GoItem>& all,
     auto row = searchRow(query);
 
     // A URL-shaped query means "take me to this URL": an EXACT normalized
-    // match still wins (typing github.com picks the GitHub tab), but a mere
-    // fuzzy hit must not steal Enter from it -- google.com opens google.com,
-    // not the mail.google.com tab.
+    // match wins and REPLACES the search row (same action, better row) --
+    // typing github.com picks the GitHub tab or place. Without one, the
+    // search row is pinned first so a mere fuzzy hit can't steal Enter --
+    // google.com opens google.com, not the mail.google.com tab.
     if (looksLikeURL(query))
     {
         auto target = normalizeURL(query);
@@ -115,13 +116,20 @@ std::vector<GoItem> rankPalette(const std::vector<GoItem>& all,
                                   { return normalizeURL(item.url) == target; });
 
         if (exact == ranked.end())
-        {
             ranked.insert(ranked.begin(), std::move(row));
-            return finish(std::move(ranked));
-        }
+        else
+            std::rotate(ranked.begin(), exact, exact + 1);
 
-        std::rotate(ranked.begin(), exact, exact + 1);
+        return finish(std::move(ranked));
     }
+
+    // A history row for this exact search would duplicate the pinned search
+    // row (searching "hacker news" twice, say) -- the action row is the one
+    // that stays. Open tabs keep theirs: they're switchable.
+    auto rowUrl = normalizeURL(row.url);
+    std::erase_if(ranked,
+                  [&](const GoItem& item)
+                  { return item.tabId < 0 && normalizeURL(item.url) == rowUrl; });
 
     ranked.push_back(std::move(row));
     return finish(std::move(ranked));

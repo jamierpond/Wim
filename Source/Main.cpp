@@ -69,6 +69,12 @@ struct BrowserView final : View
 
         transport.getBridge().use(api);
 
+        chromeBar.addScriptMessageHandler("wimChrome",
+                                          [this](const std::string& command)
+                                          {
+                                              if (command == "toggleMaximize")
+                                                  onToggleMaximize();
+                                          });
         chromeBar.loadHTML(chromeBarHtml);
 
         addChildren({content, chromeBar});
@@ -575,7 +581,14 @@ struct BrowserView final : View
 <html><head><meta charset="utf-8"><style>
   html, body { margin: 0; height: 100%; }
   body { background: #131316; --eacp-app-region: drag; }
-</style></head><body></body></html>)HTML";
+</style></head><body><script>
+  addEventListener('dblclick', () =>
+      window.webkit?.messageHandlers?.wimChrome?.postMessage('toggleMaximize'));
+</script></body></html>)HTML";
+
+    // Bound by WimApp, which owns the Window: double-clicking the chrome bar
+    // zooms to fill the workspace, like a native titlebar.
+    std::function<void()> onToggleMaximize = [] {};
 
     Api::WimApi api;
     emberstore::Database durable {emberstore::appDataDirectory("pond", "Wim"),
@@ -609,9 +622,31 @@ struct WimApp
 {
     WimApp()
     {
-        setApplicationMenuBar(buildDefaultWebViewMenuBar());
+        setApplicationMenuBar(buildMenuBar());
+        view.onToggleMaximize = [this] { window.toggleMaximize(); };
         window.setContentView(view);
         window.toggleMaximize();
+    }
+
+    // The Edit menu is load-bearing: macOS only delivers Cmd+X/C/V/A to the
+    // focused view (the palette input, page fields) by matching them against
+    // the menu bar -- without it, paste is dead everywhere.
+    static MenuBar buildMenuBar()
+    {
+        auto bar = MenuBar {};
+        bar.add(standardApplicationMenu("Wim"));
+        bar.add(standardEditMenu());
+
+        auto viewMenu = Menu {"View"};
+        viewMenu.add(MenuItem::withAction(
+            "Zoom In", WebHelpers::zoomInFocusedWebView, commandKey("+")));
+        viewMenu.add(MenuItem::withAction(
+            "Zoom Out", WebHelpers::zoomOutFocusedWebView, commandKey("-")));
+        viewMenu.add(MenuItem::withAction(
+            "Actual Size", WebHelpers::resetSizedFocusedWebView, commandKey("0")));
+        bar.add(std::move(viewMenu));
+
+        return bar;
     }
 
     // Frameless chrome: the page runs edge to edge under a hidden, transparent
@@ -628,7 +663,6 @@ struct WimApp
         options.minHeight = 320;
 
         options.flags.add(WindowFlags::FullSizeContentView);
-        options.flags.add(WindowFlags::FullScreen);
         options.showTitle = false;
         options.titlebarTransparent = true;
         options.showTitlebarSeparator = false;

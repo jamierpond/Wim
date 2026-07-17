@@ -69,9 +69,13 @@ export default function App() {
                 />
 
                 <ul className="items">
+                    {/* Index keys on purpose: every publish replaces the whole
+                        list, and URL-based keys can collide (the pinned search
+                        row vs a history row for the same search), which makes
+                        React leave stale rows behind and skip highlights. */}
                     {results.items.map((item, index) => (
                         <Row
-                            key={item.tabId >= 0 ? `tab:${item.tabId}` : `url:${item.url}`}
+                            key={index}
                             item={item}
                             selected={index === results.selected}
                             rowRef={index === results.selected ? selectedRef : undefined}
