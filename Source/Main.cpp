@@ -29,6 +29,16 @@ static constexpr auto vimiumScript = R"JS(
     const post = command =>
         window.webkit?.messageHandlers?.wim?.postMessage(command);
 
+    // The window is frameless; eacp's window-drag shim (installed in every
+    // WebView) makes any element styled --eacp-app-region: drag move the
+    // window. Foreign pages never declare one, so give every page a thin
+    // strip along the hidden-titlebar band.
+    const dragStrip = document.createElement('div');
+    dragStrip.style.cssText =
+        'position:fixed;top:0;left:0;right:0;height:16px;'
+        + 'z-index:2147483646;--eacp-app-region:drag;';
+    document.documentElement.appendChild(dragStrip);
+
     const step = 60;
     const half = () => window.innerHeight / 2;
 
@@ -844,19 +854,18 @@ struct BrowserView final : View
 
     void publishResults()
     {
-        api.results.publish({paletteFiltered, paletteSelected, generation});
+        api.results.publish(
+            {paletteFiltered,
+             paletteSelected,
+             generation,
+             activeTab != nullptr ? activeTab->url : std::string {}});
     }
 
     // --- Page commands ----------------------------------------------------------
 
     void handleCommand(const std::string& command)
     {
-        if (command == "focusAddressBar")
-        {
-            addressBar.setText("");
-            addressBar.focus();
-        }
-        else if (command == "openPalette")
+        if (command == "openPalette")
             showPalette();
         else if (command == "toggleBookmark")
         {
@@ -869,12 +878,6 @@ struct BrowserView final : View
             cycleTab(1);
         else if (command == "prevTab")
             cycleTab(-1);
-    }
-
-    void navigateActive(const std::string& text)
-    {
-        activeTab->view().loadURL(searchURL(text));
-        activeTab->view().focusContent();
     }
 
     // --- URL helpers ----------------------------------------------------------
@@ -943,7 +946,6 @@ struct BrowserView final : View
     static constexpr auto homePage = "https://www.wikipedia.org";
 
     Api::WimApi api;
-    AddressBar addressBar {std::string(homePage)};
     emberstore::Database db {emberstore::appDataDirectory("pond", "Wim"),
                              emberstore::Durability::Durable};
     PlacesStore places {db};
@@ -962,7 +964,6 @@ struct BrowserView final : View
     std::string paletteQuery;
     std::vector<GoItem> paletteAll;
     std::vector<GoItem> paletteFiltered;
-    Rect contentBounds;
     WebView paletteWeb {paletteOptions()};
     WebViewBridge transport {paletteWeb};
     Threads::Timer previewTimer {[this] { handlePreviewTick(); }, 8};
@@ -976,6 +977,9 @@ struct WimApp
         window.setContentView(view);
     }
 
+    // Frameless chrome: the page runs edge to edge under a hidden, transparent
+    // title bar -- only the traffic lights remain, and the green one
+    // fullscreens.
     static WindowOptions getOptions()
     {
         auto options = WindowOptions();
@@ -985,6 +989,13 @@ struct WimApp
         options.height = 760;
         options.minWidth = 480;
         options.minHeight = 320;
+
+        options.flags.add(WindowFlags::FullSizeContentView);
+        options.flags.add(WindowFlags::FullScreen);
+        options.showTitle = false;
+        options.titlebarTransparent = true;
+        options.showTitlebarSeparator = false;
+        options.cornerRadius = 12.f;
 
         return options;
     }

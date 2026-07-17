@@ -12,6 +12,15 @@ body,
     font-family: -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
+.dragstrip {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 16px;
+    --eacp-app-region: drag;
+}
+
 .backdrop {
     height: 100%;
     padding-top: 8vh;

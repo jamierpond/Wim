@@ -11,12 +11,19 @@ export default function App() {
     const inputRef = useRef<HTMLInputElement>(null);
     const selectedRef = useRef<HTMLLIElement>(null);
 
+    // On open: pre-fill the input with the current URL, fully selected — it
+    // does NOT filter (the native query starts empty), it's there so
+    // ⌘L → ⌘A → ⌘C copies the URL, and any typing replaces it.
     useEffect(() => {
-        setQuery('');
-        const focus = () => inputRef.current?.focus();
+        setQuery(results.currentUrl);
+        const focus = () => {
+            inputRef.current?.focus();
+            inputRef.current?.select();
+        };
         focus();
         const late = setTimeout(focus, 60);
         return () => clearTimeout(late);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [results.generation]);
 
     useEffect(() => {
@@ -48,6 +55,7 @@ export default function App() {
 
     return (
         <div className="backdrop" onMouseDown={() => void backend.cancel()}>
+            <div className="dragstrip" />
             <div className="palette" onMouseDown={(e) => e.stopPropagation()}>
                 <input
                     ref={inputRef}
