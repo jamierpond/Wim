@@ -29,9 +29,9 @@ struct PlacesFile
 // starter set.
 struct PlacesStore
 {
-    explicit PlacesStore(const emberstore::Database& db,
-                         std::filesystem::path legacyPathToUse =
-                             defaultLegacyPath());
+    explicit PlacesStore(
+        const emberstore::Database& db,
+        std::filesystem::path legacyPathToUse = defaultLegacyPath());
 
     bool contains(const std::string& normalizedUrl);
 

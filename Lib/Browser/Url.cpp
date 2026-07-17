@@ -24,8 +24,7 @@ bool looksLikeURL(const std::string& text)
     if (text.find(' ') != std::string::npos)
         return false;
 
-    return text.find('.') != std::string::npos
-           || text.starts_with("localhost");
+    return text.find('.') != std::string::npos || text.starts_with("localhost");
 }
 
 std::string withScheme(const std::string& url)

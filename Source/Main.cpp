@@ -1,237 +1,26 @@
-#include "FuzzyMatch.h"
+#include "ErrorPage.h"
+#include "History.h"
+#include "Mru.h"
+#include "PageScript.h"
+#include "Palette.h"
+#include "Places.h"
+#include "Session.h"
 #include "Types.h"
+#include "Url.h"
 
 #include <eacp/WebView/WebView.h>
+#include <eacp/WebView/WebView/JsStringLiteral.h>
 #include <emberstore/AppDatabase.h>
-#include <emberstore/Emberstore.h>
 
 #include <algorithm>
-#include <chrono>
-#include <cstdlib>
 #include <filesystem>
-#include <fstream>
+#include <string>
 #include <utility>
+#include <vector>
 
 using namespace eacp;
 using namespace Graphics;
-
-// Vimium-style bindings, injected into every page at document start. Add new
-// bindings to the `bindings` map below -- keys are keypress sequences ('gg'
-// works, as long as no binding is a strict prefix of another), values run when
-// the sequence completes. `post(command)` sends a command string to the native
-// side, handled in BrowserView::handleCommand.
-static constexpr auto vimiumScript = R"JS(
-(() => {
-    if (window.__wimInstalled)
-        return;
-    window.__wimInstalled = true;
-
-    const post = command =>
-        window.webkit?.messageHandlers?.wim?.postMessage(command);
-
-    // The window is frameless; eacp's window-drag shim (installed in every
-    // WebView) makes any element styled --eacp-app-region: drag move the
-    // window. Foreign pages never declare one, so give every page a thin
-    // strip along the hidden-titlebar band.
-    const dragStrip = document.createElement('div');
-    dragStrip.style.cssText =
-        'position:fixed;top:0;left:0;right:0;height:16px;'
-        + 'z-index:2147483646;--eacp-app-region:drag;';
-    document.documentElement.appendChild(dragStrip);
-
-    const step = 60;
-    const half = () => window.innerHeight / 2;
-
-    const bindings = {
-        'j': () => scrollBy(0, step),
-        'k': () => scrollBy(0, -step),
-        'h': () => scrollBy(-step, 0),
-        'l': () => scrollBy(step, 0),
-        'd': () => scrollBy(0, half()),
-        'u': () => scrollBy(0, -half()),
-        'gg': () => scrollTo(0, 0),
-        'G': () => scrollTo(0, document.documentElement.scrollHeight),
-        'H': () => history.back(),
-        'L': () => history.forward(),
-        'r': () => location.reload(),
-        'o': () => post('openPalette'),
-        't': () => post('openPalette'),
-        'b': () => post('toggleBookmark'),
-        'x': () => post('closeTab'),
-        'J': () => post('prevTab'),
-        'K': () => post('nextTab'),
-        'f': () => enterHintMode(),
-    };
-
-    // --- Link hints ('f') ------------------------------------------------
-
-    const hintChars = 'asdfghjkl';
-    let hintState = null;
-
-    function hintLabels(count) {
-        let length = 1;
-        while (Math.pow(hintChars.length, length) < count)
-            length++;
-
-        return Array.from({length: count}, (_, i) => {
-            let n = i, label = '';
-            for (let d = 0; d < length; d++) {
-                label = hintChars[n % hintChars.length] + label;
-                n = Math.floor(n / hintChars.length);
-            }
-            return label;
-        });
-    }
-
-    function clickables() {
-        const selector = 'a[href], button, input, select, textarea, summary, '
-            + '[onclick], [role="button"], [role="link"], [tabindex]';
-        return [...document.querySelectorAll(selector)].filter(el => {
-            const r = el.getBoundingClientRect();
-            return r.width > 0 && r.height > 0
-                && r.bottom > 0 && r.top < innerHeight
-                && r.right > 0 && r.left < innerWidth
-                && getComputedStyle(el).visibility !== 'hidden';
-        });
-    }
-
-    function enterHintMode() {
-        const els = clickables();
-        if (!els.length)
-            return;
-
-        const labels = hintLabels(els.length);
-        const overlay = document.createElement('div');
-        overlay.style.cssText =
-            'position:fixed;inset:0;z-index:2147483647;pointer-events:none;';
-
-        els.forEach((el, i) => {
-            const r = el.getBoundingClientRect();
-            const tag = document.createElement('span');
-            tag.textContent = labels[i].toUpperCase();
-            tag.dataset.label = labels[i];
-            tag.style.cssText =
-                `position:fixed;left:${Math.max(0, r.left)}px;`
-                + `top:${Math.max(0, r.top)}px;`
-                + 'background:#ffd76e;color:#302505;'
-                + 'font:bold 11px/1.3 -apple-system,sans-serif;'
-                + 'padding:1px 3px;border:1px solid #c38a22;border-radius:3px;'
-                + 'box-shadow:0 1px 2px rgba(0,0,0,.4);';
-            overlay.appendChild(tag);
-        });
-
-        document.documentElement.appendChild(overlay);
-        hintState = {els, labels, typed: '', overlay};
-    }
-
-    function exitHintMode() {
-        hintState?.overlay.remove();
-        hintState = null;
-    }
-
-    function activate(el) {
-        el.focus();
-        const editable = el.matches(
-            'textarea, select, [contenteditable], input:not([type=button])'
-            + ':not([type=submit]):not([type=checkbox]):not([type=radio])');
-        if (!editable)
-            el.click();
-    }
-
-    function handleHintKey(event) {
-        if (event.key === 'Escape' || !hintChars.includes(event.key)) {
-            exitHintMode();
-            return;
-        }
-
-        hintState.typed += event.key;
-        const matches = hintState.labels.filter(
-            label => label.startsWith(hintState.typed));
-
-        if (matches.length === 1 && matches[0] === hintState.typed) {
-            const el = hintState.els[hintState.labels.indexOf(matches[0])];
-            exitHintMode();
-            activate(el);
-            return;
-        }
-
-        if (!matches.length) {
-            exitHintMode();
-            return;
-        }
-
-        [...hintState.overlay.children].forEach(tag => {
-            tag.style.display =
-                tag.dataset.label.startsWith(hintState.typed) ? '' : 'none';
-        });
-    }
-
-    // --- Key dispatch -----------------------------------------------------
-
-    let pending = '';
-    let pendingTimer = 0;
-
-    function isEditable(el) {
-        return el && (el.isContentEditable
-            || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName));
-    }
-
-    addEventListener('keydown', event => {
-        if (event.metaKey && !event.ctrlKey && !event.altKey
-            && event.key === 'l') {
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            post('openPalette');
-            return;
-        }
-
-        if (event.metaKey || event.ctrlKey || event.altKey)
-            return;
-
-        if (hintState) {
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            handleHintKey(event);
-            return;
-        }
-
-        if (isEditable(document.activeElement)) {
-            if (event.key === 'Escape')
-                document.activeElement.blur();
-            return;
-        }
-
-        if (event.key.length !== 1) {
-            pending = '';
-            return;
-        }
-
-        const candidate = pending + event.key;
-        clearTimeout(pendingTimer);
-
-        if (bindings[candidate]) {
-            pending = '';
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            bindings[candidate]();
-            return;
-        }
-
-        const isPrefix = Object.keys(bindings)
-            .some(seq => seq.startsWith(candidate));
-
-        if (isPrefix) {
-            pending = candidate;
-            event.preventDefault();
-            event.stopImmediatePropagation();
-            pendingTimer = setTimeout(() => { pending = ''; }, 800);
-            return;
-        }
-
-        pending = '';
-    }, true);
-})();
-)JS";
+using namespace wim;
 
 struct Tab
 {
@@ -253,174 +42,6 @@ struct Tab
     EA::OwningPointer<WebView> webView;
     std::string title;
     std::string url;
-};
-
-struct Place
-{
-    std::string title;
-    std::string url;
-
-    MIRO_REFLECT(title, url)
-};
-
-struct PlacesFile
-{
-    std::vector<Place> places;
-
-    MIRO_REFLECT(places)
-};
-
-// The user's saved places, an emberstore collection keyed by normalized URL
-// (<app data>/pond/Wim/places.json). First run imports the legacy
-// ~/.wim/places.json if present, else seeds a starter set.
-struct PlacesStore
-{
-    explicit PlacesStore(const emberstore::Database& db)
-        : collection(db.collection<Place>("places"))
-    {
-        if (!collection.empty())
-            return;
-
-        if (!importLegacy())
-            seedDefaults();
-    }
-
-    bool contains(const std::string& normalizedUrl)
-    {
-        return collection.contains(normalizedUrl);
-    }
-
-    void toggle(const std::string& title, const std::string& url)
-    {
-        auto ref = collection.doc(normalize(url));
-
-        if (ref.exists())
-        {
-            ref.remove();
-            return;
-        }
-
-        ref.set({title.empty() ? url : title, url});
-    }
-
-    std::vector<Place> all() { return collection.values(); }
-
-    static std::string normalize(std::string url)
-    {
-        for (auto* prefix: {"https://", "http://"})
-        {
-            auto view = std::string_view(prefix);
-
-            if (url.starts_with(view))
-            {
-                url = url.substr(view.size());
-                break;
-            }
-        }
-
-        if (url.starts_with("www."))
-            url = url.substr(4);
-
-        while (!url.empty() && url.back() == '/')
-            url.pop_back();
-
-        return url;
-    }
-
-    bool importLegacy()
-    {
-        auto* home = std::getenv("HOME");
-        auto legacyPath = std::filesystem::path(home != nullptr ? home : ".")
-                          / ".wim" / "places.json";
-        auto file = std::ifstream(legacyPath);
-
-        if (!file)
-            return false;
-
-        auto text = std::string(std::istreambuf_iterator<char>(file), {});
-        auto legacy = PlacesFile {};
-        Miro::fromJSONString(legacy, text);
-
-        for (auto& place: legacy.places)
-            collection.doc(normalize(place.url)).set(place);
-
-        return !collection.empty();
-    }
-
-    void seedDefaults()
-    {
-        auto seeds = std::vector<Place> {{"GitHub", "https://github.com"},
-                                         {"Gmail", "https://mail.google.com"},
-                                         {"Linear", "https://linear.app"},
-                                         {"Wikipedia", "https://www.wikipedia.org"}};
-
-        for (auto& place: seeds)
-            collection.doc(normalize(place.url)).set(place);
-    }
-
-    emberstore::Collection<Place> collection;
-};
-
-struct Stamp
-{
-    std::int64_t at = 0;
-
-    MIRO_REFLECT(at)
-};
-
-// Recency stamps for palette ordering, keyed by normalized URL. Written on
-// every real use (palette pick, tab cycle, active-tab navigation), so Atomic
-// not Durable -- losing the last stamps to a power cut is harmless.
-struct MruStore
-{
-    explicit MruStore(const emberstore::Database& db)
-        : stamps(db.collection<Stamp>("mru"))
-    {
-        prune();
-    }
-
-    void touch(const std::string& normalizedUrl)
-    {
-        stamps.doc(normalizedUrl).set({nowMs()});
-    }
-
-    std::int64_t lastUsed(const std::string& normalizedUrl)
-    {
-        if (auto stamp = stamps.get(normalizedUrl))
-            return stamp->at;
-
-        return 0;
-    }
-
-    void prune()
-    {
-        if (stamps.size() <= maxEntries)
-            return;
-
-        auto aged = std::vector<std::pair<std::int64_t, std::string>> {};
-
-        for (auto& id: stamps.ids())
-            aged.push_back({lastUsed(id), id});
-
-        std::sort(aged.begin(), aged.end());
-
-        auto excess = aged.size() - maxEntries;
-
-        for (std::size_t i = 0; i < excess; ++i)
-            stamps.remove(aged[i].second);
-    }
-
-    static std::int64_t nowMs()
-    {
-        using namespace std::chrono;
-        return (std::int64_t) duration_cast<milliseconds>(
-                   system_clock::now().time_since_epoch())
-            .count();
-    }
-
-    static constexpr std::size_t maxEntries = 500;
-
-    emberstore::Collection<Stamp> stamps;
 };
 
 struct BrowserView final : View
@@ -447,16 +68,25 @@ struct BrowserView final : View
 
         transport.getBridge().use(api);
 
-        addChildren({content});
-        openTab(homePage);
+        chromeBar.loadHTML(chromeBarHtml);
+
+        addChildren({content, chromeBar});
+        restoreSession();
     }
 
-    // Tab webviews live inside `content`; the palette is a permanently later
-    // sibling of it. Switching tabs only touches content's children, so the
-    // palette's key focus survives live previews.
+    // The chrome bar owns the titlebar band (its whole surface is an
+    // --eacp-app-region drag handle, traffic lights float inside it); pages
+    // lay out below it, never underneath. Tab webviews live inside `content`;
+    // the palette is a permanently later sibling, so switching tabs never
+    // touches its key focus.
+    //
+    // NOTE: root-level child coordinates are currently unflipped on macOS
+    // (same as eacp's own Browser example), so the VISUAL top band is
+    // removeFromBottom here.
     void resized() override
     {
         auto bounds = getLocalBounds();
+        chromeBar.setBounds(bounds.removeFromBottom(chromeBarHeight));
         content.setBounds(bounds);
 
         if (activeTab != nullptr)
@@ -464,6 +94,36 @@ struct BrowserView final : View
 
         if (paletteOpen)
             paletteWeb.setBounds(getLocalBounds());
+    }
+
+    // --- Session ----------------------------------------------------------------
+
+    void restoreSession()
+    {
+        auto state = session.load();
+
+        if (state.urls.empty())
+        {
+            openTab(homePage);
+            return;
+        }
+
+        for (auto& url: state.urls)
+            createTab(url);
+
+        switchTo(*tabs[(int) state.active]);
+        syncPalette();
+    }
+
+    void saveSession()
+    {
+        auto state = SessionState {};
+
+        for (auto& tab: tabs)
+            state.urls.push_back(tab->url);
+
+        state.active = std::max(tabs.getIndexOfItem(activeTab), 0);
+        session.save(std::move(state));
     }
 
     // --- Tabs -----------------------------------------------------------------
@@ -476,6 +136,10 @@ struct BrowserView final : View
             "wim", [this](const std::string& command) { handleCommand(command); });
 
         wireTab(tab);
+
+        // Known before any navigation event arrives, so a session save that
+        // lands mid-load (or a load that fails outright) keeps the tab.
+        tab.url = url;
         tab.view().loadURL(url);
         return tab;
     }
@@ -503,12 +167,18 @@ struct BrowserView final : View
         auto* t = &tab;
         auto& view = tab.view();
 
+        // The http guard keeps loadHTML navigations (the error page) from
+        // clobbering the tab's real URL or polluting history.
         view.onNavigationStarted = [this, t](const std::string& url)
         {
-            t->url = url;
+            if (url.starts_with("http"))
+            {
+                t->url = url;
+                history.recordVisit(url, "", MruStore::nowMs());
 
-            if (t == activeTab)
-                mru.touch(PlacesStore::normalize(url));
+                if (t == activeTab)
+                    mru.touch(normalizeURL(url));
+            }
 
             syncPalette();
         };
@@ -516,6 +186,12 @@ struct BrowserView final : View
         view.onTitleChanged = [this, t](const std::string& title)
         {
             t->title = title;
+
+            // The error page's own title must not rename the entry of the
+            // URL that failed; its view sits on about:blank, not http(s).
+            if (t->view().getURL().starts_with("http"))
+                history.updateTitle(t->url, title);
+
             syncPalette();
         };
 
@@ -525,11 +201,26 @@ struct BrowserView final : View
                 t->view().focusContent();
         };
 
+        view.onNavigationFailed = [t](const std::string& error)
+        { t->view().loadHTML(errorPageHTML(t->url, error)); };
+
         view.onNewWindowRequested =
             [this](EA::OwningPointer<WebView> popup, const std::string&)
         {
             adoptPopup(std::move(popup));
             return true;
+        };
+
+        view.onDownloadFinished = [this, t](const std::string& path)
+        {
+            auto name = std::filesystem::path(path).filename().string();
+            showToast(activeTab != nullptr ? *activeTab : *t, "Downloaded " + name);
+        };
+
+        view.onDownloadFailed = [this, t](const std::string& error)
+        {
+            showToast(activeTab != nullptr ? *activeTab : *t,
+                      "Download failed: " + error);
         };
 
         view.onClose = [this, t] { Threads::callAsync([this, t] { closeTab(t); }); };
@@ -549,6 +240,8 @@ struct BrowserView final : View
 
         if (!paletteOpen)
             tab.view().focusContent();
+
+        saveSession();
     }
 
     void closeTab(Tab* tab)
@@ -598,15 +291,6 @@ struct BrowserView final : View
         return nullptr;
     }
 
-    bool hasTabWithURL(const std::string& normalizedUrl)
-    {
-        for (auto& tab: tabs)
-            if (PlacesStore::normalize(tab->url) == normalizedUrl)
-                return true;
-
-        return false;
-    }
-
     void cycleTab(int direction)
     {
         auto index = tabs.getIndexOfItem(activeTab);
@@ -615,7 +299,7 @@ struct BrowserView final : View
             return;
 
         auto next = (index + direction + tabs.size()) % tabs.size();
-        mru.touch(PlacesStore::normalize(tabs[next]->url));
+        mru.touch(normalizeURL(tabs[next]->url));
         switchTo(*tabs[next]);
     }
 
@@ -736,7 +420,7 @@ struct BrowserView final : View
 
     void openItem(const GoItem& item)
     {
-        mru.touch(PlacesStore::normalize(item.url));
+        mru.touch(normalizeURL(item.url));
 
         if (item.tabId >= 0)
         {
@@ -764,92 +448,44 @@ struct BrowserView final : View
     }
 
     // Rebuild the merged tabs+places list, re-rank it against the current
-    // query, and push the render model. Called on every tab/place mutation so
-    // an open palette stays live.
+    // query, push the render model, and keep the on-disk session current.
+    // Called on every tab/place mutation so an open palette stays live.
     void syncPalette()
     {
         rebuildPaletteItems();
         refilterPalette();
         publishResults();
+        saveSession();
     }
 
     void rebuildPaletteItems()
     {
-        paletteAll.clear();
+        auto tabItems = std::vector<GoItem> {};
 
         for (auto& tab: tabs)
         {
-            paletteAll.push_back(
-                {tab->id,
-                 tab->title.empty() ? tab->url : tab->title,
-                 tab->url,
-                 places.contains(PlacesStore::normalize(tab->url))});
+            auto item = GoItem {};
+            item.tabId = tab->id;
+            item.title = tab->title.empty() ? tab->url : tab->title;
+            item.url = tab->url;
+            tabItems.push_back(std::move(item));
         }
 
-        for (auto& place: places.all())
-            if (!hasTabWithURL(PlacesStore::normalize(place.url)))
-                paletteAll.push_back({-1, place.title, place.url, true});
-
-        // MRU is the palette's base order: whatever you used last is on top.
-        // The fuzzy re-rank in refilterPalette is stable, so equal scores
-        // keep this order too.
-        std::stable_sort(paletteAll.begin(),
-                         paletteAll.end(),
-                         [this](const GoItem& a, const GoItem& b)
-                         {
-                             return mru.lastUsed(PlacesStore::normalize(a.url))
-                                    > mru.lastUsed(PlacesStore::normalize(b.url));
-                         });
+        paletteAll = mergePaletteItems(std::move(tabItems),
+                                       places.all(),
+                                       [this](const std::string& url)
+                                       { return mru.lastUsed(url); });
     }
 
     void refilterPalette()
     {
-        paletteFiltered.clear();
-
-        if (paletteQuery.empty())
-        {
-            paletteFiltered = paletteAll;
-        }
-        else
-        {
-            auto scored = std::vector<std::pair<int, const GoItem*>> {};
-
-            // score > 0 is the "really hit" bar: full-subsequence matches
-            // spread thin across a long title/URL go negative on gap
-            // penalties and shouldn't outrank the search row.
-            for (auto& item: paletteAll)
-            {
-                auto score =
-                    wim::fuzzyScore(paletteQuery, item.title + " " + item.url);
-
-                if (score && *score > 0)
-                    scored.push_back({*score, &item});
-            }
-
-            std::stable_sort(scored.begin(),
-                             scored.end(),
-                             [](const auto& a, const auto& b)
-                             { return a.first > b.first; });
-
-            for (auto& [score, item]: scored)
-                paletteFiltered.push_back(*item);
-        }
-
-        if (!paletteQuery.empty())
-            paletteFiltered.push_back(searchRow(paletteQuery));
+        paletteFiltered = rankPalette(
+            paletteAll,
+            paletteQuery.empty() ? std::vector<HistoryEntry> {} : history.all(),
+            paletteQuery);
 
         auto last = std::max((int) paletteFiltered.size() - 1, 0);
         paletteSelected = std::clamp(paletteSelected, 0, last);
-    }
-
-    static GoItem searchRow(const std::string& query)
-    {
-        auto row = GoItem {};
-        row.title = looksLikeURL(query) ? "Open " + query
-                                        : "Search Google for “" + query + "”";
-        row.url = searchURL(query);
-        row.isSearch = true;
-        return row;
     }
 
     void publishResults()
@@ -880,59 +516,37 @@ struct BrowserView final : View
             cycleTab(-1);
     }
 
-    // --- URL helpers ----------------------------------------------------------
-
-    static std::string searchURL(const std::string& query)
+    // A page-side notification for events with no chrome of their own
+    // (finished downloads, etc.).
+    void showToast(Tab& tab, const std::string& message)
     {
-        if (looksLikeURL(query))
-            return withScheme(query);
+        auto script = std::string {"(() => {"}
+                      + "const toast = document.createElement('div');"
+                      + "toast.textContent = " + jsStringLiteral(message) + ";"
+                      + "toast.style.cssText = 'position:fixed;bottom:20px;"
+                        "right:20px;z-index:2147483647;background:#222;"
+                        "color:#fff;padding:10px 14px;border-radius:8px;"
+                        "font:13px -apple-system,sans-serif;"
+                        "box-shadow:0 4px 12px rgba(0,0,0,.35)';"
+                      + "document.documentElement.appendChild(toast);"
+                      + "setTimeout(() => toast.remove(), 4000); })()";
 
-        return "https://www.google.com/search?q=" + urlEncode(query);
-    }
-
-    static bool looksLikeURL(const std::string& text)
-    {
-        if (text.find("://") != std::string::npos)
-            return true;
-
-        return text.find(' ') == std::string::npos
-               && text.find('.') != std::string::npos;
-    }
-
-    static std::string withScheme(const std::string& url)
-    {
-        if (url.find("://") != std::string::npos)
-            return url;
-
-        return "https://" + url;
-    }
-
-    static std::string urlEncode(const std::string& text)
-    {
-        auto encoded = std::string {};
-
-        for (auto c: text)
-        {
-            if (std::isalnum((unsigned char) c) || c == '-' || c == '_' || c == '.'
-                || c == '~')
-                encoded += c;
-            else if (c == ' ')
-                encoded += '+';
-            else
-            {
-                char buffer[4];
-                std::snprintf(buffer, sizeof(buffer), "%%%02X", (unsigned char) c);
-                encoded += buffer;
-            }
-        }
-
-        return encoded;
+        tab.view().evaluateJavaScript(script);
     }
 
     static WebView::Options getWebViewOptions()
     {
         auto options = WebView::Options();
         options.statusBar = false;
+
+        // The engine tail Safari itself appends. WebKit derives the OS/WebKit
+        // prefix, so the UA reads as stock Safari and sites (Google sign-in
+        // especially) treat Wim as a real browser, not an embedded web view.
+        options.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15";
+
+        options.backForwardGestures = true;
+        options.allowsMagnification = true;
+        options.elementFullscreen = true;
         return options;
     }
 
@@ -945,12 +559,25 @@ struct BrowserView final : View
 
     static constexpr auto homePage = "https://www.wikipedia.org";
 
+    static constexpr auto chromeBarHeight = 38.f;
+
+    // Our own titlebar chrome, FancyWindow-style: one flat surface whose CSS
+    // declares the whole bar a window-drag region.
+    static constexpr auto chromeBarHtml = R"HTML(<!doctype html>
+<html><head><meta charset="utf-8"><style>
+  html, body { margin: 0; height: 100%; }
+  body { background: #131316; --eacp-app-region: drag; }
+</style></head><body></body></html>)HTML";
+
     Api::WimApi api;
-    emberstore::Database db {emberstore::appDataDirectory("pond", "Wim"),
-                             emberstore::Durability::Durable};
-    PlacesStore places {db};
-    MruStore mru {
-        emberstore::Database {db.directory(), emberstore::Durability::Atomic}};
+    emberstore::Database durable {emberstore::appDataDirectory("pond", "Wim"),
+                                  emberstore::Durability::Durable};
+    emberstore::Database atomic {durable.directory(),
+                                 emberstore::Durability::Atomic};
+    PlacesStore places {durable};
+    MruStore mru {atomic};
+    HistoryStore history {atomic};
+    SessionStore session {atomic};
     View content;
     EA::OwnedVector<Tab> tabs;
     Tab* activeTab = nullptr;
@@ -964,6 +591,7 @@ struct BrowserView final : View
     std::string paletteQuery;
     std::vector<GoItem> paletteAll;
     std::vector<GoItem> paletteFiltered;
+    WebView chromeBar {getWebViewOptions()};
     WebView paletteWeb {paletteOptions()};
     WebViewBridge transport {paletteWeb};
     Threads::Timer previewTimer {[this] { handlePreviewTick(); }, 8};
@@ -975,11 +603,12 @@ struct WimApp
     {
         setApplicationMenuBar(buildDefaultWebViewMenuBar());
         window.setContentView(view);
+        window.toggleMaximize();
     }
 
     // Frameless chrome: the page runs edge to edge under a hidden, transparent
     // title bar -- only the traffic lights remain, and the green one
-    // fullscreens.
+    // fullscreens. Starts filling the workspace, like a browser should.
     static WindowOptions getOptions()
     {
         auto options = WindowOptions();
@@ -996,6 +625,9 @@ struct WimApp
         options.titlebarTransparent = true;
         options.showTitlebarSeparator = false;
         options.cornerRadius = 12.f;
+
+        // Centers the ~16pt-tall light cluster in the 38pt chrome bar.
+        options.trafficLightPosition = Point {17.f, 11.f};
 
         return options;
     }

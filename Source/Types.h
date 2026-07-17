@@ -19,7 +19,11 @@ struct GoItem
     bool bookmarked = false;
     bool isSearch = false;
 
-    MIRO_REFLECT(tabId, title, url, bookmarked, isSearch)
+    // The tab's last navigation failed (it shows an error page). Dead pages
+    // rank below the search row and render dimmed.
+    bool failed = false;
+
+    MIRO_REFLECT(tabId, title, url, bookmarked, isSearch, failed)
 };
 
 // The palette's whole render model. Filtering, ranking and selection are
