@@ -2,8 +2,11 @@
 #include "Types.h"
 
 #include <eacp/WebView/WebView.h>
+#include <emberstore/AppDatabase.h>
+#include <emberstore/Emberstore.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -41,7 +44,7 @@ static constexpr auto vimiumScript = R"JS(
         'H': () => history.back(),
         'L': () => history.forward(),
         'r': () => location.reload(),
-        'o': () => post('focusAddressBar'),
+        'o': () => post('openPalette'),
         't': () => post('openPalette'),
         'b': () => post('toggleBookmark'),
         'x': () => post('closeTab'),
@@ -164,6 +167,14 @@ static constexpr auto vimiumScript = R"JS(
     }
 
     addEventListener('keydown', event => {
+        if (event.metaKey && !event.ctrlKey && !event.altKey
+            && event.key === 'l') {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            post('openPalette');
+            return;
+        }
+
         if (event.metaKey || event.ctrlKey || event.altKey)
             return;
 
@@ -212,24 +223,6 @@ static constexpr auto vimiumScript = R"JS(
 })();
 )JS";
 
-struct AddressBar final : TextInput
-{
-    using TextInput::TextInput;
-
-    void keyDown(const KeyEvent& event) override
-    {
-        if (event.keyCode == KeyCode::Escape)
-        {
-            onEscape();
-            return;
-        }
-
-        TextInput::keyDown(event);
-    }
-
-    std::function<void()> onEscape = [] {};
-};
-
 struct Tab
 {
     Tab(std::int64_t idToUse, WebView::Options options)
@@ -267,59 +260,40 @@ struct PlacesFile
     MIRO_REFLECT(places)
 };
 
-// The user's saved places, persisted as editable JSON at ~/.wim/places.json.
+// The user's saved places, an emberstore collection keyed by normalized URL
+// (<app data>/pond/Wim/places.json). First run imports the legacy
+// ~/.wim/places.json if present, else seeds a starter set.
 struct PlacesStore
 {
-    PlacesStore() { load(); }
-
-    void load()
+    explicit PlacesStore(const emberstore::Database& db)
+        : collection(db.collection<Place>("places"))
     {
-        auto file = std::ifstream(path());
-
-        if (!file)
-        {
-            seedDefaults();
-            save();
+        if (!collection.empty())
             return;
-        }
 
-        auto text = std::string(std::istreambuf_iterator<char>(file), {});
-        Miro::fromJSONString(data, text);
+        if (!importLegacy())
+            seedDefaults();
     }
 
-    void save()
+    bool contains(const std::string& normalizedUrl)
     {
-        std::filesystem::create_directories(path().parent_path());
-        auto file = std::ofstream(path());
-        file << Miro::toJSONString(data, 2);
-    }
-
-    bool contains(const std::string& normalizedUrl) const
-    {
-        for (auto& place: data.places)
-            if (normalize(place.url) == normalizedUrl)
-                return true;
-
-        return false;
+        return collection.contains(normalizedUrl);
     }
 
     void toggle(const std::string& title, const std::string& url)
     {
-        auto normalized = normalize(url);
+        auto ref = collection.doc(normalize(url));
 
-        for (auto it = data.places.begin(); it != data.places.end(); ++it)
+        if (ref.exists())
         {
-            if (normalize(it->url) == normalized)
-            {
-                data.places.erase(it);
-                save();
-                return;
-            }
+            ref.remove();
+            return;
         }
 
-        data.places.push_back({title.empty() ? url : title, url});
-        save();
+        ref.set({title.empty() ? url : title, url});
     }
+
+    std::vector<Place> all() { return collection.values(); }
 
     static std::string normalize(std::string url)
     {
@@ -343,22 +317,100 @@ struct PlacesStore
         return url;
     }
 
-    static std::filesystem::path path()
+    bool importLegacy()
     {
         auto* home = std::getenv("HOME");
-        return std::filesystem::path(home != nullptr ? home : ".") / ".wim"
-               / "places.json";
+        auto legacyPath = std::filesystem::path(home != nullptr ? home : ".")
+                          / ".wim" / "places.json";
+        auto file = std::ifstream(legacyPath);
+
+        if (!file)
+            return false;
+
+        auto text = std::string(std::istreambuf_iterator<char>(file), {});
+        auto legacy = PlacesFile {};
+        Miro::fromJSONString(legacy, text);
+
+        for (auto& place: legacy.places)
+            collection.doc(normalize(place.url)).set(place);
+
+        return !collection.empty();
     }
 
     void seedDefaults()
     {
-        data.places = {{"GitHub", "https://github.com"},
-                       {"Gmail", "https://mail.google.com"},
-                       {"Linear", "https://linear.app"},
-                       {"Wikipedia", "https://www.wikipedia.org"}};
+        auto seeds = std::vector<Place> {{"GitHub", "https://github.com"},
+                                         {"Gmail", "https://mail.google.com"},
+                                         {"Linear", "https://linear.app"},
+                                         {"Wikipedia", "https://www.wikipedia.org"}};
+
+        for (auto& place: seeds)
+            collection.doc(normalize(place.url)).set(place);
     }
 
-    PlacesFile data;
+    emberstore::Collection<Place> collection;
+};
+
+struct Stamp
+{
+    std::int64_t at = 0;
+
+    MIRO_REFLECT(at)
+};
+
+// Recency stamps for palette ordering, keyed by normalized URL. Written on
+// every real use (palette pick, tab cycle, active-tab navigation), so Atomic
+// not Durable -- losing the last stamps to a power cut is harmless.
+struct MruStore
+{
+    explicit MruStore(const emberstore::Database& db)
+        : stamps(db.collection<Stamp>("mru"))
+    {
+        prune();
+    }
+
+    void touch(const std::string& normalizedUrl)
+    {
+        stamps.doc(normalizedUrl).set({nowMs()});
+    }
+
+    std::int64_t lastUsed(const std::string& normalizedUrl)
+    {
+        if (auto stamp = stamps.get(normalizedUrl))
+            return stamp->at;
+
+        return 0;
+    }
+
+    void prune()
+    {
+        if (stamps.size() <= maxEntries)
+            return;
+
+        auto aged = std::vector<std::pair<std::int64_t, std::string>> {};
+
+        for (auto& id: stamps.ids())
+            aged.push_back({lastUsed(id), id});
+
+        std::sort(aged.begin(), aged.end());
+
+        auto excess = aged.size() - maxEntries;
+
+        for (std::size_t i = 0; i < excess; ++i)
+            stamps.remove(aged[i].second);
+    }
+
+    static std::int64_t nowMs()
+    {
+        using namespace std::chrono;
+        return (std::int64_t) duration_cast<milliseconds>(
+                   system_clock::now().time_since_epoch())
+            .count();
+    }
+
+    static constexpr std::size_t maxEntries = 500;
+
+    emberstore::Collection<Stamp> stamps;
 };
 
 struct BrowserView final : View
@@ -385,11 +437,7 @@ struct BrowserView final : View
 
         transport.getBridge().use(api);
 
-        addressBar.onSubmit([this](const std::string& text)
-                            { navigateActive(text); });
-        addressBar.onEscape = [this] { activeTab->view().focusContent(); };
-
-        addChildren({addressBar, content});
+        addChildren({content});
         openTab(homePage);
     }
 
@@ -399,7 +447,6 @@ struct BrowserView final : View
     void resized() override
     {
         auto bounds = getLocalBounds();
-        addressBar.setBounds(bounds.removeFromTop(44.f).inset(8.f, 7.f));
         content.setBounds(bounds);
 
         if (activeTab != nullptr)
@@ -451,7 +498,7 @@ struct BrowserView final : View
             t->url = url;
 
             if (t == activeTab)
-                addressBar.setText(url);
+                mru.touch(PlacesStore::normalize(url));
 
             syncPalette();
         };
@@ -464,7 +511,7 @@ struct BrowserView final : View
 
         view.onNavigationFinished = [this, t](const std::string&)
         {
-            if (t == activeTab && !addressBar.hasFocus() && !paletteOpen)
+            if (t == activeTab && !paletteOpen)
                 t->view().focusContent();
         };
 
@@ -489,7 +536,6 @@ struct BrowserView final : View
         activeTab = &tab;
         content.addSubview(tab.view());
         tab.view().setBounds(content.getLocalBounds());
-        addressBar.setText(tab.url);
 
         if (!paletteOpen)
             tab.view().focusContent();
@@ -559,6 +605,7 @@ struct BrowserView final : View
             return;
 
         auto next = (index + direction + tabs.size()) % tabs.size();
+        mru.touch(PlacesStore::normalize(tabs[next]->url));
         switchTo(*tabs[next]);
     }
 
@@ -679,6 +726,8 @@ struct BrowserView final : View
 
     void openItem(const GoItem& item)
     {
+        mru.touch(PlacesStore::normalize(item.url));
+
         if (item.tabId >= 0)
         {
             if (auto* tab = findTab(item.tabId))
@@ -727,9 +776,20 @@ struct BrowserView final : View
                  places.contains(PlacesStore::normalize(tab->url))});
         }
 
-        for (auto& place: places.data.places)
+        for (auto& place: places.all())
             if (!hasTabWithURL(PlacesStore::normalize(place.url)))
                 paletteAll.push_back({-1, place.title, place.url, true});
+
+        // MRU is the palette's base order: whatever you used last is on top.
+        // The fuzzy re-rank in refilterPalette is stable, so equal scores
+        // keep this order too.
+        std::stable_sort(paletteAll.begin(),
+                         paletteAll.end(),
+                         [this](const GoItem& a, const GoItem& b)
+                         {
+                             return mru.lastUsed(PlacesStore::normalize(a.url))
+                                    > mru.lastUsed(PlacesStore::normalize(b.url));
+                         });
     }
 
     void refilterPalette()
@@ -884,7 +944,11 @@ struct BrowserView final : View
 
     Api::WimApi api;
     AddressBar addressBar {std::string(homePage)};
-    PlacesStore places;
+    emberstore::Database db {emberstore::appDataDirectory("pond", "Wim"),
+                             emberstore::Durability::Durable};
+    PlacesStore places {db};
+    MruStore mru {
+        emberstore::Database {db.directory(), emberstore::Durability::Atomic}};
     View content;
     EA::OwnedVector<Tab> tabs;
     Tab* activeTab = nullptr;

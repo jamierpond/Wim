@@ -19,6 +19,14 @@ CPMAddPackage(
         GIT_TAG main
 )
 
+# Local persistence (Firestore-flavoured JSON documents). Must come after
+# eacp -- emberstore fetches its own copy only when no eacp targets exist.
+CPMAddPackage(
+        NAME emberstore
+        GITHUB_REPOSITORY tamber-inc/emberstore
+        GIT_TAG main
+)
+
 list(APPEND CMAKE_MODULE_PATH "${eacp_SOURCE_DIR}/CMake")
 
 # eacp only sets its bundle plist template when built top-level.
@@ -34,3 +42,5 @@ eacp_add_webview_app(Wim
         BUNDLE_ID   com.pond.wim
         BUNDLE_NAME "Wim"
         REACT)
+
+target_link_libraries(Wim PRIVATE emberstore)

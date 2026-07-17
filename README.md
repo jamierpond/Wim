@@ -60,7 +60,7 @@ The wire surface lives in `Source/Types.h` (`Api::WimApi`): commands
 | `f`  | Link hints — type the label to follow a link |
 | `H` / `L` | History back / forward     |
 | `r`  | Reload                          |
-| `t`  | Open the Go palette             |
+| `t` / `⌘L` | Open the Go palette       |
 | `b`  | Bookmark current page as a place |
 | `o`  | Focus the address bar           |
 | `x`  | Close the current tab           |

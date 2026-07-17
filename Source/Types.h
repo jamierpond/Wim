@@ -31,7 +31,11 @@ struct GoResults
     std::int64_t selected = 0;
     std::int64_t generation = 0;
 
-    MIRO_REFLECT(items, selected, generation)
+    // The active tab's URL. The palette pre-fills its input with this
+    // (selected, not filtering), so ⌘L → ⌘A → ⌘C copies the current URL.
+    std::string currentUrl;
+
+    MIRO_REFLECT(items, selected, generation, currentUrl)
 };
 
 struct GoQuery
