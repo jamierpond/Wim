@@ -1,3 +1,4 @@
+#include "Control.h"
 #include "ErrorPage.h"
 #include "History.h"
 #include "Mru.h"
@@ -8,12 +9,18 @@
 #include "Types.h"
 #include "Url.h"
 
+#include <eacp/Network/IPC/Lock.h>
+#include <eacp/Network/IPCRpc/RpcClient.h>
+#include <eacp/Network/IPCRpc/RpcServer.h>
 #include <eacp/WebView/WebView.h>
 #include <eacp/WebView/WebView/JsStringLiteral.h>
 #include <emberstore/AppDatabase.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -83,7 +90,81 @@ struct BrowserView final : View
         chromeBar.loadHTML(chromeBarHtml);
 
         addChildren({content, chromeBar});
+        setupControl();
         restoreSession();
+    }
+
+    // --- CLI control plane ------------------------------------------------------
+
+    // Serve the singleton control channel: list / focus / open commands from a
+    // later `./Wim --...` invocation land here. Only the lock-holding instance
+    // reaches this, so the name is ours -- but a control-plane hiccup must
+    // never take the browser down, hence the swallowed IPC::Error.
+    void setupControl()
+    {
+        controlApi.onListTabs = [this] { return buildTabList(); };
+        controlApi.onFocusTab = [this](std::int64_t id) { return focusTabById(id); };
+        controlApi.onOpenUrl = [this](const std::string& text)
+        { return openUrlFromControl(text); };
+        controlApi.onReactivate = [this]
+        {
+            onActivateWindow();
+            return Control::Ack {true, ""};
+        };
+
+        controlBridge.use(controlApi);
+
+        try
+        {
+            controlServer.emplace(Control::channelName, controlBridge);
+        }
+        catch (const IPC::Error&)
+        {
+        }
+    }
+
+    Control::TabList buildTabList()
+    {
+        auto list = Control::TabList {};
+
+        for (auto& tab: tabs)
+        {
+            auto info = Control::TabInfo {};
+            info.id = tab->id;
+            info.title = tab->title.empty() ? tab->url : tab->title;
+            info.url = tab->url;
+            info.active = tab.get() == activeTab;
+            info.failed = tab->failed;
+            list.tabs.push_back(std::move(info));
+        }
+
+        return list;
+    }
+
+    Control::Ack focusTabById(std::int64_t id)
+    {
+        auto* tab = findTab(id);
+
+        if (tab == nullptr)
+            return {false, "no open tab with id " + std::to_string(id)};
+
+        if (paletteOpen)
+            hidePalette();
+
+        mru.touch(normalizeURL(tab->url));
+        switchTo(*tab);
+        onActivateWindow();
+        return {true, ""};
+    }
+
+    Control::Ack openUrlFromControl(const std::string& text)
+    {
+        if (text.empty())
+            return {false, "no url given"};
+
+        openTab(navigationURL(text));
+        onActivateWindow();
+        return {true, ""};
     }
 
     // The chrome bar owns the titlebar band (its whole surface is an
@@ -657,6 +738,10 @@ struct BrowserView final : View
     // zooms to fill the workspace, like a native titlebar.
     std::function<void()> onToggleMaximize = [] {};
 
+    // Bound by WimApp: raise and activate the window. Fired when a CLI control
+    // command (focus / open / a duplicate launch) brings the browser forward.
+    std::function<void()> onActivateWindow = [] {};
+
     Api::WimApi api;
     emberstore::Database durable {emberstore::appDataDirectory("pond", "Wim"),
                                   emberstore::Durability::Durable};
@@ -683,6 +768,12 @@ struct BrowserView final : View
     WebView paletteWeb {paletteOptions()};
     WebViewBridge transport {paletteWeb};
     Threads::Timer previewTimer {[this] { handlePreviewTick(); }, 8};
+
+    // The CLI control plane. controlServer is last on purpose: it must be torn
+    // down before the bridge and api it dispatches into.
+    Control::ControlApi controlApi;
+    Miro::Bridge controlBridge;
+    std::optional<IPC::RpcServer> controlServer;
 };
 
 struct WimApp
@@ -691,6 +782,7 @@ struct WimApp
     {
         setApplicationMenuBar(buildMenuBar());
         view.onToggleMaximize = [this] { window.toggleMaximize(); };
+        view.onActivateWindow = [this] { window.toFront(); };
         window.setContentView(view);
         window.toggleMaximize();
     }
@@ -745,7 +837,225 @@ struct WimApp
     Window window {getOptions()};
 };
 
-int main()
+// --- CLI control commands -------------------------------------------------------
+
+// A control command aimed at the running singleton. Reactivate is the internal
+// "a duplicate launch lost the lock -- raise the existing window" case; the
+// other three come straight from the CLI flags.
+enum class ControlKind
 {
-    return eacp::Apps::run<WimApp>();
+    ListTabs,
+    FocusTab,
+    OpenUrl,
+    Reactivate
+};
+
+struct ControlRequest
+{
+    ControlKind kind;
+    std::int64_t tabId = -1;
+    std::string url;
+};
+
+namespace
+{
+// Handed to ControlClientApp, which Apps::run default-constructs and so cannot
+// be passed the request directly.
+std::optional<ControlRequest> pendingRequest;
+
+[[noreturn]] void usageError(const std::string& message)
+{
+    std::fprintf(stderr, "wim: %s\n", message.c_str());
+    std::exit(2);
+}
+
+std::int64_t parseTabId(const std::string& text)
+{
+    try
+    {
+        return std::stoll(text);
+    }
+    catch (const std::exception&)
+    {
+        usageError("--focus-tab expects a numeric tab id, got '" + text + "'");
+    }
+}
+
+// Recognises the control flags; returns nullopt for a plain launch. A known
+// flag missing its argument is a hard usage error rather than a silent launch.
+std::optional<ControlRequest> parseControlRequest(const std::vector<std::string>& args)
+{
+    for (std::size_t i = 1; i < args.size(); ++i)
+    {
+        const auto& arg = args[i];
+
+        if (arg == "--list-open-tabs")
+            return ControlRequest {.kind = ControlKind::ListTabs};
+
+        if (arg == "--focus-tab")
+        {
+            if (i + 1 >= args.size())
+                usageError("--focus-tab needs a tab id");
+
+            return ControlRequest {.kind = ControlKind::FocusTab,
+                                   .tabId = parseTabId(args[i + 1])};
+        }
+
+        if (arg == "--open-url")
+        {
+            if (i + 1 >= args.size())
+                usageError("--open-url needs a url");
+
+            return ControlRequest {.kind = ControlKind::OpenUrl, .url = args[i + 1]};
+        }
+
+        if (arg.starts_with("--"))
+            usageError("unknown option '" + arg + "'");
+    }
+
+    return std::nullopt;
+}
+} // namespace
+
+// A windowless app that dials the running instance, issues the pending command
+// and quits with the result. It never creates a Window, so `./Wim --...` acts
+// on the existing browser without launching a second one. Missing instance:
+// the dial never lands, onDisconnected reports "not running" and exits 1 (a
+// duplicate-launch reactivate exits 0 silently -- a plain launch shouldn't
+// error just because the peer raced away).
+struct ControlClientApp
+{
+    ControlClientApp()
+    {
+        // A control command is a quick round trip, not an app -- keep it out
+        // of the Dock and the app switcher.
+        eacp::Apps::setDockIconVisible(false);
+
+        client.onConnected = [this]
+        {
+            connected = true;
+            dispatch();
+        };
+
+        client.onDisconnected = [this]
+        {
+            if (settled)
+                return;
+
+            settled = true;
+            auto reactivate = pendingRequest->kind == ControlKind::Reactivate;
+
+            if (!connected && !reactivate)
+                std::fputs("wim: not running\n", stderr);
+
+            eacp::Apps::quit(reactivate || connected ? 0 : 1);
+        };
+    }
+
+    void dispatch()
+    {
+        const auto& request = *pendingRequest;
+
+        switch (request.kind)
+        {
+            case ControlKind::ListTabs:
+                client.call<Control::TabList>("listTabs")
+                    .then([this](Control::TabList list) { printTabs(list); },
+                          [this](const std::string& error) { fail(error); });
+                break;
+
+            case ControlKind::FocusTab:
+                client.call<Control::Ack>("focusTab", Control::TabRef {request.tabId})
+                    .then([this](Control::Ack ack) { reportAck(ack); },
+                          [this](const std::string& error) { fail(error); });
+                break;
+
+            case ControlKind::OpenUrl:
+                client.call<Control::Ack>("openUrl", Control::UrlRef {request.url})
+                    .then([this](Control::Ack ack) { reportAck(ack); },
+                          [this](const std::string& error) { fail(error); });
+                break;
+
+            case ControlKind::Reactivate:
+                client.call<Control::Ack>("reactivate")
+                    .then([this](Control::Ack) { finish(0); },
+                          [this](const std::string&) { finish(0); });
+                break;
+        }
+    }
+
+    // id, active marker, title, url -- tab-separated so `cut -f1` yields the id
+    // to hand back to `--focus-tab`.
+    void printTabs(const Control::TabList& list)
+    {
+        for (auto& tab: list.tabs)
+            std::printf("%lld\t%s\t%s\t%s\n",
+                        (long long) tab.id,
+                        tab.active ? "*" : "",
+                        tab.title.c_str(),
+                        tab.url.c_str());
+
+        finish(0);
+    }
+
+    void reportAck(const Control::Ack& ack)
+    {
+        if (!ack.ok && !ack.message.empty())
+            std::fprintf(stderr, "wim: %s\n", ack.message.c_str());
+
+        finish(ack.ok ? 0 : 1);
+    }
+
+    void fail(const std::string& reason)
+    {
+        if (settled)
+            return;
+
+        std::fprintf(stderr, "wim: %s\n", reason.empty() ? "request failed"
+                                                         : reason.c_str());
+        finish(1);
+    }
+
+    void finish(int code)
+    {
+        if (settled)
+            return;
+
+        settled = true;
+        eacp::Apps::quit(code);
+    }
+
+    bool connected = false;
+    bool settled = false;
+    eacp::IPC::RpcClient client {Control::channelName, eacp::Time::MS {4000}};
+};
+
+int main(int argc, char* argv[])
+{
+    using namespace eacp;
+
+    Apps::setCommandLineArgs(argc, argv);
+
+    // An explicit control flag never launches a window: talk to the running
+    // instance and exit.
+    if (auto request = parseControlRequest({argv, argv + argc}))
+    {
+        pendingRequest = request;
+        return Apps::run<ControlClientApp>();
+    }
+
+    // Plain launch. Hold the per-user singleton for the whole process; the
+    // static locals outlive Apps::run, so the lock is released only at exit
+    // (or by the kernel on a crash). Losing it means another Wim already owns
+    // the window -- raise that one and go, don't open a second.
+    static IPC::Lock instanceLock {Control::lockName};
+    static IPC::ScopedLock held {instanceLock};
+
+    if (!held)
+    {
+        pendingRequest = ControlRequest {.kind = ControlKind::Reactivate};
+        return Apps::run<ControlClientApp>();
+    }
+
+    return Apps::run<WimApp>(argc, argv);
 }
