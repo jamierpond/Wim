@@ -389,18 +389,21 @@ struct BrowserView final : View
                             { navigateActive(text); });
         addressBar.onEscape = [this] { activeTab->view().focusContent(); };
 
-        addChildren({addressBar});
+        addChildren({addressBar, content});
         openTab(homePage);
     }
 
+    // Tab webviews live inside `content`; the palette is a permanently later
+    // sibling of it. Switching tabs only touches content's children, so the
+    // palette's key focus survives live previews.
     void resized() override
     {
         auto bounds = getLocalBounds();
         addressBar.setBounds(bounds.removeFromTop(44.f).inset(8.f, 7.f));
-        contentBounds = bounds;
+        content.setBounds(bounds);
 
         if (activeTab != nullptr)
-            activeTab->view().setBounds(contentBounds);
+            activeTab->view().setBounds(content.getLocalBounds());
 
         if (paletteOpen)
             paletteWeb.setBounds(getLocalBounds());
@@ -484,16 +487,11 @@ struct BrowserView final : View
             activeTab->view().removeFromParent();
 
         activeTab = &tab;
-        addSubview(tab.view());
-        tab.view().setBounds(contentBounds);
+        content.addSubview(tab.view());
+        tab.view().setBounds(content.getLocalBounds());
         addressBar.setText(tab.url);
 
-        if (paletteOpen)
-        {
-            paletteWeb.removeFromParent();
-            addSubview(paletteWeb);
-        }
-        else
+        if (!paletteOpen)
             tab.view().focusContent();
     }
 
@@ -508,9 +506,6 @@ struct BrowserView final : View
 
         if (tab == originTab)
             originTab = nullptr;
-
-        if (tab == previewTab)
-            previewTab = nullptr;
 
         if (wasActive)
         {
@@ -550,8 +545,7 @@ struct BrowserView final : View
     bool hasTabWithURL(const std::string& normalizedUrl)
     {
         for (auto& tab: tabs)
-            if (tab.get() != previewTab
-                && PlacesStore::normalize(tab->url) == normalizedUrl)
+            if (PlacesStore::normalize(tab->url) == normalizedUrl)
                 return true;
 
         return false;
@@ -628,8 +622,8 @@ struct BrowserView final : View
         previewSelected();
     }
 
-    // Enter. A touched selection was already previewed (or is about to be) --
-    // apply it and dismiss. An untouched palette dismisses without moving.
+    // Enter. A touched tab selection was already previewed live; a place or
+    // the search row loads now. An untouched palette dismisses without moving.
     void activatePalette()
     {
         if (!paletteOpen)
@@ -637,27 +631,17 @@ struct BrowserView final : View
 
         if (paletteTouched && !paletteFiltered.empty())
         {
-            previewSelected();
-            commitPalette();
+            openItem(paletteFiltered[(size_t) paletteSelected]);
             return;
         }
 
-        if (paletteFiltered.empty() && !paletteQuery.empty())
-        {
-            openQueryFromPalette(paletteQuery);
-            return;
-        }
-
-        commitPalette();
+        hidePalette();
     }
 
     void chooseItem(const GoItem& item)
     {
-        if (!paletteOpen)
-            return;
-
-        previewItem(item);
-        commitPalette();
+        if (paletteOpen)
+            openItem(item);
     }
 
     void previewSelected()
@@ -680,36 +664,29 @@ struct BrowserView final : View
         previewSelected();
     }
 
-    // Selection moved in the palette: change the page underneath right away,
-    // so Enter only dismisses. Saved places that aren't open are loaded into a
-    // single reused preview tab.
+    // Selection moved in the palette: switching between OPEN tabs previews
+    // live underneath (it's free), so Enter only dismisses. Places that
+    // aren't open would cost a page load per selection change, so they only
+    // load when actually chosen (Enter / click).
     void previewItem(const GoItem& item)
     {
-        if (!paletteOpen)
+        if (!paletteOpen || item.tabId < 0)
             return;
 
+        if (auto* tab = findTab(item.tabId))
+            switchTo(*tab);
+    }
+
+    void openItem(const GoItem& item)
+    {
         if (item.tabId >= 0)
         {
             if (auto* tab = findTab(item.tabId))
                 switchTo(*tab);
-
-            return;
         }
-
-        if (previewTab == nullptr)
-            previewTab = &createTab(item.url);
         else
-            previewTab->view().loadURL(item.url);
+            openTab(item.url);
 
-        switchTo(*previewTab);
-    }
-
-    void commitPalette()
-    {
-        if (previewTab != nullptr && previewTab != activeTab)
-            closeTab(previewTab);
-
-        previewTab = nullptr;
         hidePalette();
     }
 
@@ -717,26 +694,6 @@ struct BrowserView final : View
     {
         if (originTab != nullptr && originTab != activeTab)
             switchTo(*originTab);
-
-        if (previewTab != nullptr)
-            closeTab(previewTab);
-
-        previewTab = nullptr;
-        hidePalette();
-    }
-
-    void openQueryFromPalette(const std::string& text)
-    {
-        auto url = searchURL(text);
-
-        if (previewTab != nullptr)
-        {
-            previewTab->view().loadURL(url);
-            switchTo(*previewTab);
-            previewTab = nullptr;
-        }
-        else
-            openTab(url);
 
         hidePalette();
     }
@@ -763,9 +720,6 @@ struct BrowserView final : View
 
         for (auto& tab: tabs)
         {
-            if (tab.get() == previewTab)
-                continue;
-
             paletteAll.push_back(
                 {tab->id,
                  tab->title.empty() ? tab->url : tab->title,
@@ -790,10 +744,15 @@ struct BrowserView final : View
         {
             auto scored = std::vector<std::pair<int, const GoItem*>> {};
 
+            // score > 0 is the "really hit" bar: full-subsequence matches
+            // spread thin across a long title/URL go negative on gap
+            // penalties and shouldn't outrank the search row.
             for (auto& item: paletteAll)
             {
-                if (auto score =
-                        wim::fuzzyScore(paletteQuery, item.title + " " + item.url))
+                auto score =
+                    wim::fuzzyScore(paletteQuery, item.title + " " + item.url);
+
+                if (score && *score > 0)
                     scored.push_back({*score, &item});
             }
 
@@ -806,8 +765,21 @@ struct BrowserView final : View
                 paletteFiltered.push_back(*item);
         }
 
+        if (!paletteQuery.empty())
+            paletteFiltered.push_back(searchRow(paletteQuery));
+
         auto last = std::max((int) paletteFiltered.size() - 1, 0);
         paletteSelected = std::clamp(paletteSelected, 0, last);
+    }
+
+    static GoItem searchRow(const std::string& query)
+    {
+        auto row = GoItem {};
+        row.title = looksLikeURL(query) ? "Open " + query
+                                        : "Search Google for “" + query + "”";
+        row.url = searchURL(query);
+        row.isSearch = true;
+        return row;
     }
 
     void publishResults()
@@ -913,10 +885,10 @@ struct BrowserView final : View
     Api::WimApi api;
     AddressBar addressBar {std::string(homePage)};
     PlacesStore places;
+    View content;
     EA::OwnedVector<Tab> tabs;
     Tab* activeTab = nullptr;
     Tab* originTab = nullptr;
-    Tab* previewTab = nullptr;
     std::int64_t nextTabId = 0;
     std::int64_t generation = 0;
     bool paletteOpen = false;

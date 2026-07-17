@@ -92,6 +92,21 @@ function Row({
     selected: boolean;
     rowRef?: React.Ref<HTMLLIElement>;
 }) {
+    if (item.isSearch) {
+        return (
+            <li
+                ref={rowRef}
+                className={`row search ${selected ? 'selected' : ''}`}
+                onClick={() => void backend.choose(item)}
+            >
+                <span className="magnifier">⌕</span>
+                <span className="text">
+                    <span className="title">{item.title}</span>
+                </span>
+            </li>
+        );
+    }
+
     return (
         <li
             ref={rowRef}

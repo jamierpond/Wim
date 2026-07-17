@@ -1,44 +1,55 @@
 # Wim
 
-A very basic keyboard-driven browser built on
-[eacp](https://github.com/jamierpond/eacp) (fetched via CPM). One window, an
-address bar, a WKWebView, and vimium-style keybindings injected into every
-page.
+A keyboard-driven browser built on [eacp](https://github.com/jamierpond/eacp)
+(fetched via CPM). Native shell (window, address bar, per-page vimium
+bindings) with the browser chrome rendered in web tech: the **Go palette** is
+a vite + React app in `web/`, talking to C++ over eacp's Miro bridge.
 
 ## Build
 
 ```bash
-just build   # configure (if needed) + build
+just build   # configure (if needed) + build (schema codegen → vite → C++)
 just run     # build + launch
 just clean   # delete the build directory
 ```
 
 Recipes are thin wrappers over Node scripts in `Scripts/` — the dispatchers
 (`compile.mjs`, `run.mjs`) pick the platform variant
-(`Scripts/<cmd>-<macos|windows>.mjs`) from `process.platform`. Without `just`:
+(`Scripts/<cmd>-<macos|windows>.mjs`) from `process.platform`.
 
-```bash
-node Scripts/compile.mjs && node Scripts/run.mjs
-```
-
-Or plain CMake:
-
-```bash
-cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build
-open build/Wim.app
-```
+UI dev loop (hot reload): configure with `-DEACP_WEBVIEW_DEV=ON`, run
+`just web-dev` (vite dev server), then run the app — it prefers the dev
+server over the embedded bundle.
 
 To develop against a local eacp checkout:
+`cmake -B build -DCPM_eacp_SOURCE=$HOME/projects/eacp`.
 
-```bash
-cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug \
-      -DCPM_eacp_SOURCE=$HOME/projects/eacp
-```
+## The Go palette
 
-## Keybindings
+`t` opens a spotlight for *your places on the web* — tab open or not, you
+just get there:
 
-Active whenever the page has focus and no text field is focused.
+- **Places** are your saved destinations (GitHub, Linear, mail, …), stored as
+  editable JSON in `~/.wim/places.json`. `b` bookmarks the current page; the
+  ★ in the palette toggles too.
+- The list merges open tabs (green dot) with places, fuzzy-filtered as you
+  type. All matching/ranking/selection logic is native C++
+  (`Source/FuzzyMatch.h`, `BrowserView` in `Source/Main.cpp`); the web app
+  only renders results and forwards input.
+- **Live preview**: moving the selection changes the page *underneath* the
+  palette immediately — Enter just dismisses, so you can already see you're
+  in the right place. Places that aren't open load into a reused preview
+  tab; Escape reverts to where you were.
+- No match? Enter opens a Google search (or the URL, if it looks like one).
+- ✕ closes an open tab from the palette.
+
+The wire surface lives in `Source/Types.h` (`Api::WimApi`): commands
+(`setQuery`, `moveSelection`, `activate`, `choose`, `cancel`, `closeItem`,
+`toggleBookmark`) plus a `results` event carrying the render model. CMake
+(`eacp_add_webview_app`) generates the typed TS client into
+`web/src/generated/`.
+
+## Keybindings (in the page)
 
 | Key  | Action                          |
 | ---- | ------------------------------- |
@@ -49,25 +60,19 @@ Active whenever the page has focus and no text field is focused.
 | `f`  | Link hints — type the label to follow a link |
 | `H` / `L` | History back / forward     |
 | `r`  | Reload                          |
+| `t`  | Open the Go palette             |
+| `b`  | Bookmark current page as a place |
 | `o`  | Focus the address bar           |
-| `t`  | Omnibar: fuzzy-find a tab, or search / open a URL in a new tab |
 | `x`  | Close the current tab           |
 | `J` / `K` | Previous / next tab        |
 | `Esc` | Blur text field / cancel hints; in the address bar, return focus to the page |
 
-## Tabs and the omnibar
+In the palette: type to filter, `↑`/`↓` or `ctrl-j`/`ctrl-k`/`ctrl-n`/`ctrl-p`
+to move (the page follows live), Enter to keep, Esc to go back.
 
-`t` opens an fzf-style omnibar over the page (`Source/TabSwitcher.h`). Typing
-fuzzy-filters the open tabs by title + URL (`Source/FuzzyMatch.h`); arrows or
-`ctrl-j`/`ctrl-k` move the selection and Enter switches to it. When nothing
-matches, Enter opens a **new tab** with a Google search for the query — or the
-URL itself if it looks like one. `Esc` dismisses.
+Add page bindings in the `bindings` map inside `vimiumScript`
+(`Source/Main.cpp`); `post('...')` sends a command string to
+`BrowserView::handleCommand`.
 
 Pages that open popups (`target=_blank`, `window.open`) get their popup
-adopted as a new tab. Each tab is a `WebView` owned by `BrowserView`
-(`Source/Main.cpp`); only the active tab's view is in the hierarchy.
-
-Add bindings in the `bindings` map inside `vimiumScript` in
-`Source/Main.cpp` — keys are keypress sequences (`gg` works), values are the
-action. `post('...')` sends a command string to the native side
-(`BrowserView::handleCommand`) for actions the page can't do itself.
+adopted as a tab.

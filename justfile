@@ -20,3 +20,7 @@ run:
 [doc('Delete the build directory')]
 clean:
     node Scripts/clean.mjs
+
+[doc('Run the palette UI vite dev server (configure with -DEACP_WEBVIEW_DEV=ON)')]
+web-dev:
+    node Scripts/web-dev.mjs

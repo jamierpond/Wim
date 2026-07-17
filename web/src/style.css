@@ -123,3 +123,16 @@ body,
     color: rgba(255, 255, 255, 0.5);
     font-size: 13px;
 }
+
+.magnifier {
+    flex: 0 0 auto;
+    width: 16px;
+    text-align: center;
+    font-size: 16px;
+    line-height: 1;
+    color: rgba(255, 255, 255, 0.55);
+}
+
+.row.search .title {
+    color: rgba(255, 255, 255, 0.75);
+}

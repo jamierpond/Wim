@@ -8,15 +8,18 @@
 #include <string>
 
 // One row in the Go palette: an open tab (tabId >= 0), a saved place
-// (tabId < 0), or both when a place is currently open in a tab.
+// (tabId < 0), or the pinned "Search Google for ..." action row (isSearch),
+// which is appended whenever a query is typed so search is always one
+// arrow-down away -- and the default when nothing matches.
 struct GoItem
 {
     std::int64_t tabId = -1;
     std::string title;
     std::string url;
     bool bookmarked = false;
+    bool isSearch = false;
 
-    MIRO_REFLECT(tabId, title, url, bookmarked)
+    MIRO_REFLECT(tabId, title, url, bookmarked, isSearch)
 };
 
 // The palette's whole render model. Filtering, ranking and selection are
