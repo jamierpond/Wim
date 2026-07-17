@@ -44,6 +44,14 @@ export default function App() {
         } else if (e.key === 'ArrowUp' || (ctrl && (e.key === 'k' || e.key === 'p'))) {
             e.preventDefault();
             void backend.moveSelection({ delta: -1 });
+        } else if (ctrl && e.key === 's') {
+            e.preventDefault();
+            const item = results.items[results.selected];
+            if (item && !item.isSearch) void backend.toggleBookmark(item);
+        } else if (ctrl && e.key === 'x') {
+            e.preventDefault();
+            const item = results.items[results.selected];
+            if (item && !item.isSearch) void backend.closeItem(item);
         } else if (e.key === 'Enter') {
             e.preventDefault();
             void backend.activate();
@@ -145,18 +153,16 @@ function Row({
                 {item.bookmarked ? '★' : '☆'}
             </button>
 
-            {item.tabId >= 0 && (
-                <button
-                    className="close"
-                    title="Close tab"
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        void backend.closeItem(item);
-                    }}
-                >
-                    ✕
-                </button>
-            )}
+            <button
+                className="close"
+                title={item.tabId >= 0 ? 'Close tab (^X)' : 'Clear suggestion (^X)'}
+                onClick={(e) => {
+                    e.stopPropagation();
+                    void backend.closeItem(item);
+                }}
+            >
+                ✕
+            </button>
         </li>
     );
 }

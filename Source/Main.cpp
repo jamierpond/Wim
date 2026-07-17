@@ -61,20 +61,25 @@ struct BrowserView final : View
         api.onCancel = [this] { Threads::callAsync([this] { cancelPalette(); }); };
         api.onCloseItem = [this](const GoItem& item)
         {
-            auto id = item.tabId;
-            Threads::callAsync([this, id] { closeTabById(id); });
+            auto cleared = item;
+            Threads::callAsync([this, cleared] { clearItem(cleared); });
         };
         api.onToggleBookmark = [this](const GoItem& item)
         { toggleBookmark(item.title, item.url); };
 
         transport.getBridge().use(api);
 
-        chromeBar.addScriptMessageHandler("wimChrome",
-                                          [this](const std::string& command)
-                                          {
-                                              if (command == "toggleMaximize")
-                                                  onToggleMaximize();
-                                          });
+        chromeBar.addScriptMessageHandler(
+            "wimChrome",
+            [this](const std::string& command)
+            {
+                if (command == "toggleMaximize")
+                    onToggleMaximize();
+                else if (command == "back" && activeTab != nullptr)
+                    activeTab->view().goBack();
+                else if (command == "forward" && activeTab != nullptr)
+                    activeTab->view().goForward();
+            });
         chromeBar.loadHTML(chromeBarHtml);
 
         addChildren({content, chromeBar});
@@ -207,6 +212,8 @@ struct BrowserView final : View
         {
             if (t == activeTab && !paletteOpen)
                 t->view().focusContent();
+
+            updateChromeNav();
         };
 
         view.onNavigationFailed = [this, t](const std::string& error)
@@ -285,6 +292,27 @@ struct BrowserView final : View
 
         if (wasActive)
             switchTo(*tabs[std::min(index, tabs.size() - 1)]);
+
+        syncPalette();
+    }
+
+    // The palette's ✕ / ctrl-x: remove whatever the row is -- close an open
+    // tab, unsave a place, or forget a history suggestion.
+    void clearItem(const GoItem& item)
+    {
+        if (item.isSearch)
+            return;
+
+        if (item.tabId >= 0)
+        {
+            closeTabById(item.tabId);
+            return;
+        }
+
+        if (item.bookmarked)
+            places.toggle(item.title, item.url);
+        else
+            history.forget(item.url);
 
         syncPalette();
     }
@@ -469,6 +497,18 @@ struct BrowserView final : View
         refilterPalette();
         publishResults();
         saveSession();
+        updateChromeNav();
+    }
+
+    void updateChromeNav()
+    {
+        auto canBack = activeTab != nullptr && activeTab->view().canGoBack();
+        auto canForward = activeTab != nullptr && activeTab->view().canGoForward();
+
+        chromeBar.evaluateJavaScript(
+            std::string {"window.__wimNav && window.__wimNav("}
+            + (canBack ? "true" : "false") + "," + (canForward ? "true" : "false")
+            + ")");
     }
 
     void rebuildPaletteItems()
@@ -580,10 +620,37 @@ struct BrowserView final : View
     static constexpr auto chromeBarHtml = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><style>
   html, body { margin: 0; height: 100%; }
-  body { background: #131316; --eacp-app-region: drag; }
-</style></head><body><script>
-  addEventListener('dblclick', () =>
-      window.webkit?.messageHandlers?.wimChrome?.postMessage('toggleMaximize'));
+  body { background: #131316; --eacp-app-region: drag;
+         display: flex; align-items: center; }
+  .nav { display: flex; gap: 2px; margin-left: 84px;
+         --eacp-app-region: no-drag; }
+  .nav button { width: 32px; height: 26px; border: none; border-radius: 6px;
+                background: transparent; color: #b9b9c4; font-size: 16px;
+                line-height: 1; padding: 0; }
+  .nav button:hover { background: #26262e; color: #fff; }
+  .nav button:disabled { opacity: .3; background: transparent; }
+  .nav button[hidden] { display: none; }
+</style></head><body>
+<div class="nav">
+  <button id="back" title="Back" disabled>&#8592;</button>
+  <button id="fwd" title="Forward" hidden>&#8594;</button>
+</div>
+<script>
+  const post = message =>
+      window.webkit?.messageHandlers?.wimChrome?.postMessage(message);
+
+  addEventListener('dblclick', event => {
+      if (event.target.tagName !== 'BUTTON')
+          post('toggleMaximize');
+  });
+
+  back.onclick = () => post('back');
+  fwd.onclick = () => post('forward');
+
+  window.__wimNav = (canBack, canForward) => {
+      back.disabled = !canBack;
+      fwd.hidden = !canForward;
+  };
 </script></body></html>)HTML";
 
     // Bound by WimApp, which owns the Window: double-clicking the chrome bar
