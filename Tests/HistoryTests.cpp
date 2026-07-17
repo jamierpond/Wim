@@ -66,6 +66,17 @@ auto tEmptyTitleKeepsOld =
     check(entryFor(history, "https://example.com").title == "Example");
 };
 
+auto tForgetDropsTheEntry = test("History/forget drops a recorded visit") = []
+{
+    auto db = testing::freshDatabase("history-forget");
+    auto history = HistoryStore {db};
+
+    history.recordVisit("https://example.com", "", 1000);
+    history.forget("https://www.example.com/");
+
+    check(history.all().empty());
+};
+
 auto tHistoryPruneKeepsNewest = test("History/prune drops the oldest entries") = []
 {
     auto db = testing::freshDatabase("history-prune");

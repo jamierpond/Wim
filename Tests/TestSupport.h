@@ -14,6 +14,7 @@ inline emberstore::Database freshDatabase(const std::string& name)
 {
     auto dir = std::filesystem::temp_directory_path() / "WimTests" / name;
     std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
     return emberstore::Database {dir.string()};
 }
 } // namespace wim::testing

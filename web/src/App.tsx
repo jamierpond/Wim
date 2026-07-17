@@ -118,10 +118,12 @@ function Row({
     return (
         <li
             ref={rowRef}
-            className={`row ${selected ? 'selected' : ''}`}
+            className={`row ${selected ? 'selected' : ''} ${item.failed ? 'failed' : ''}`}
             onClick={() => void backend.choose(item)}
         >
-            <span className={`dot ${item.tabId >= 0 ? 'open' : ''}`} />
+            <span
+                className={`dot ${item.failed ? 'dead' : item.tabId >= 0 ? 'open' : ''}`}
+            />
 
             <span className="text">
                 <span className="title">{item.title || item.url}</span>

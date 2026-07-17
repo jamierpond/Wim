@@ -145,6 +145,22 @@ auto tURLQueryWithoutExactMatchOpensTheURL =
     check(ranked.back().url == "https://mail.google.com/");
 };
 
+auto tDeadPagesSinkBelowSearch =
+    test("Palette/a dead page never outranks the search row") = []
+{
+    auto deadTab = GoItem {};
+    deadTab.tabId = 0;
+    deadTab.title = "Can't reach this page";
+    deadTab.url = "https://hackernews.com/";
+    deadTab.failed = true;
+
+    auto ranked = rankPalette({deadTab}, {}, "hacker news");
+
+    check(ranked.size() == 2);
+    check(ranked.front().isSearch);
+    check(ranked.back().failed);
+};
+
 auto tURLQueryPrefersTheExactItem =
     test("Palette/a URL query picks the exactly-matching item first") = []
 {

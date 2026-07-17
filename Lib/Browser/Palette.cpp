@@ -117,14 +117,14 @@ std::vector<GoItem> rankPalette(const std::vector<GoItem>& all,
         if (exact == ranked.end())
         {
             ranked.insert(ranked.begin(), std::move(row));
-            return ranked;
+            return finish(std::move(ranked));
         }
 
         std::rotate(ranked.begin(), exact, exact + 1);
     }
 
     ranked.push_back(std::move(row));
-    return ranked;
+    return finish(std::move(ranked));
 }
 
 GoItem searchRow(const std::string& query)

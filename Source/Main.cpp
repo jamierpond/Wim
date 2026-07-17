@@ -42,6 +42,7 @@ struct Tab
     EA::OwningPointer<WebView> webView;
     std::string title;
     std::string url;
+    bool failed = false;
 };
 
 struct BrowserView final : View
@@ -174,6 +175,7 @@ struct BrowserView final : View
             if (url.starts_with("http"))
             {
                 t->url = url;
+                t->failed = false;
                 history.recordVisit(url, "", MruStore::nowMs());
 
                 if (t == activeTab)
@@ -187,9 +189,9 @@ struct BrowserView final : View
         {
             t->title = title;
 
-            // The error page's own title must not rename the entry of the
-            // URL that failed; its view sits on about:blank, not http(s).
-            if (t->view().getURL().starts_with("http"))
+            // The error page's own title must not rename the history entry
+            // of the URL that failed to load.
+            if (!t->failed)
                 history.updateTitle(t->url, title);
 
             syncPalette();
@@ -201,8 +203,13 @@ struct BrowserView final : View
                 t->view().focusContent();
         };
 
-        view.onNavigationFailed = [t](const std::string& error)
-        { t->view().loadHTML(errorPageHTML(t->url, error)); };
+        view.onNavigationFailed = [this, t](const std::string& error)
+        {
+            t->failed = true;
+            history.forget(t->url);
+            t->view().loadHTML(errorPageHTML(t->url, error));
+            syncPalette();
+        };
 
         view.onNewWindowRequested =
             [this](EA::OwningPointer<WebView> popup, const std::string&)
@@ -468,6 +475,7 @@ struct BrowserView final : View
             item.tabId = tab->id;
             item.title = tab->title.empty() ? tab->url : tab->title;
             item.url = tab->url;
+            item.failed = tab->failed;
             tabItems.push_back(std::move(item));
         }
 
