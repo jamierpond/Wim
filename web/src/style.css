@@ -1,0 +1,125 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+    height: 100%;
+    background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.backdrop {
+    height: 100%;
+    padding-top: 8vh;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    background: rgba(0, 0, 0, 0.35);
+}
+
+.palette {
+    width: min(680px, calc(100vw - 60px));
+    max-height: 70vh;
+    display: flex;
+    flex-direction: column;
+    background: rgba(24, 24, 28, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 14px;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+    overflow: hidden;
+}
+
+.query {
+    padding: 15px 18px;
+    font-size: 16px;
+    color: #f2f2f5;
+    background: transparent;
+    border: none;
+    outline: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.query::placeholder {
+    color: rgba(255, 255, 255, 0.35);
+}
+
+.items {
+    list-style: none;
+    overflow-y: auto;
+}
+
+.row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 14px;
+    cursor: default;
+}
+
+.row.selected {
+    background: rgba(90, 130, 255, 0.28);
+}
+
+.dot {
+    flex: 0 0 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.15);
+}
+
+.dot.open {
+    background: #63d47e;
+}
+
+.text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.title {
+    color: #f2f2f5;
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.url {
+    color: rgba(255, 255, 255, 0.45);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.star,
+.close {
+    flex: 0 0 auto;
+    background: none;
+    border: none;
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.35);
+    cursor: pointer;
+    padding: 2px 5px;
+}
+
+.star.active {
+    color: #ffd76e;
+}
+
+.star:hover,
+.close:hover {
+    color: #fff;
+}
+
+.empty {
+    padding: 14px 18px;
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 13px;
+}

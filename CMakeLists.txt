@@ -21,17 +21,16 @@ CPMAddPackage(
 
 list(APPEND CMAKE_MODULE_PATH "${eacp_SOURCE_DIR}/CMake")
 
-add_executable(Wim Source/Main.cpp)
-target_link_libraries(Wim PRIVATE eacp-webview)
+# eacp only sets its bundle plist template when built top-level.
+set(EACP_MACOS_PLIST "${eacp_SOURCE_DIR}/CMake/macOSBundleInfo.plist.in"
+        CACHE INTERNAL "eacp macOS bundle Info.plist template")
 
-set(BUNDLE_ID "com.pond.wim")
-
-set_target_properties(Wim PROPERTIES
-        MACOSX_BUNDLE TRUE
-        MACOSX_BUNDLE_BUNDLE_NAME "Wim"
-        MACOSX_BUNDLE_GUI_IDENTIFIER ${BUNDLE_ID}
-        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER ${BUNDLE_ID}
-        MACOSX_BUNDLE_INFO_PLIST "${eacp_SOURCE_DIR}/CMake/macOSBundleInfo.plist.in")
-
-eacp_set_gui_subsystem(Wim)
-set_default_warnings_level(Wim)
+eacp_add_webview_app(Wim
+        SOURCES     Source/Main.cpp
+        API         Api::WimApi
+        API_HEADER  ${CMAKE_CURRENT_SOURCE_DIR}/Source/Types.h
+        WEB_DIR     ${CMAKE_CURRENT_SOURCE_DIR}/web
+        CATEGORY    WimGo
+        BUNDLE_ID   com.pond.wim
+        BUNDLE_NAME "Wim"
+        REACT)

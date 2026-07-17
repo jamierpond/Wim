@@ -50,7 +50,22 @@ Active whenever the page has focus and no text field is focused.
 | `H` / `L` | History back / forward     |
 | `r`  | Reload                          |
 | `o`  | Focus the address bar           |
+| `t`  | Omnibar: fuzzy-find a tab, or search / open a URL in a new tab |
+| `x`  | Close the current tab           |
+| `J` / `K` | Previous / next tab        |
 | `Esc` | Blur text field / cancel hints; in the address bar, return focus to the page |
+
+## Tabs and the omnibar
+
+`t` opens an fzf-style omnibar over the page (`Source/TabSwitcher.h`). Typing
+fuzzy-filters the open tabs by title + URL (`Source/FuzzyMatch.h`); arrows or
+`ctrl-j`/`ctrl-k` move the selection and Enter switches to it. When nothing
+matches, Enter opens a **new tab** with a Google search for the query — or the
+URL itself if it looks like one. `Esc` dismisses.
+
+Pages that open popups (`target=_blank`, `window.open`) get their popup
+adopted as a new tab. Each tab is a `WebView` owned by `BrowserView`
+(`Source/Main.cpp`); only the active tab's view is in the hierarchy.
 
 Add bindings in the `bindings` map inside `vimiumScript` in
 `Source/Main.cpp` — keys are keypress sequences (`gg` works), values are the

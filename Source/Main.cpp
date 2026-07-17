@@ -1,6 +1,13 @@
+#include "FuzzyMatch.h"
+#include "Types.h"
+
 #include <eacp/WebView/WebView.h>
 
-#include "TabSwitcher.h"
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <utility>
 
 using namespace eacp;
 using namespace Graphics;
@@ -35,7 +42,8 @@ static constexpr auto vimiumScript = R"JS(
         'L': () => history.forward(),
         'r': () => location.reload(),
         'o': () => post('focusAddressBar'),
-        't': () => post('openSwitcher'),
+        't': () => post('openPalette'),
+        'b': () => post('toggleBookmark'),
         'x': () => post('closeTab'),
         'J': () => post('prevTab'),
         'K': () => post('nextTab'),
@@ -224,42 +232,162 @@ struct AddressBar final : TextInput
 
 struct Tab
 {
-    explicit Tab(WebView::Options options)
-        : webView(new WebView(std::move(options)))
+    Tab(std::int64_t idToUse, WebView::Options options)
+        : id(idToUse)
+        , webView(new WebView(std::move(options)))
     {
     }
 
-    explicit Tab(EA::OwningPointer<WebView> adopted)
-        : webView(std::move(adopted))
+    Tab(std::int64_t idToUse, EA::OwningPointer<WebView> adopted)
+        : id(idToUse)
+        , webView(std::move(adopted))
     {
     }
 
     WebView& view() { return *webView; }
 
+    std::int64_t id;
     EA::OwningPointer<WebView> webView;
     std::string title;
     std::string url;
+};
+
+struct Place
+{
+    std::string title;
+    std::string url;
+
+    MIRO_REFLECT(title, url)
+};
+
+struct PlacesFile
+{
+    std::vector<Place> places;
+
+    MIRO_REFLECT(places)
+};
+
+// The user's saved places, persisted as editable JSON at ~/.wim/places.json.
+struct PlacesStore
+{
+    PlacesStore() { load(); }
+
+    void load()
+    {
+        auto file = std::ifstream(path());
+
+        if (!file)
+        {
+            seedDefaults();
+            save();
+            return;
+        }
+
+        auto text = std::string(std::istreambuf_iterator<char>(file), {});
+        Miro::fromJSONString(data, text);
+    }
+
+    void save()
+    {
+        std::filesystem::create_directories(path().parent_path());
+        auto file = std::ofstream(path());
+        file << Miro::toJSONString(data, 2);
+    }
+
+    bool contains(const std::string& normalizedUrl) const
+    {
+        for (auto& place: data.places)
+            if (normalize(place.url) == normalizedUrl)
+                return true;
+
+        return false;
+    }
+
+    void toggle(const std::string& title, const std::string& url)
+    {
+        auto normalized = normalize(url);
+
+        for (auto it = data.places.begin(); it != data.places.end(); ++it)
+        {
+            if (normalize(it->url) == normalized)
+            {
+                data.places.erase(it);
+                save();
+                return;
+            }
+        }
+
+        data.places.push_back({title.empty() ? url : title, url});
+        save();
+    }
+
+    static std::string normalize(std::string url)
+    {
+        for (auto* prefix: {"https://", "http://"})
+        {
+            auto view = std::string_view(prefix);
+
+            if (url.starts_with(view))
+            {
+                url = url.substr(view.size());
+                break;
+            }
+        }
+
+        if (url.starts_with("www."))
+            url = url.substr(4);
+
+        while (!url.empty() && url.back() == '/')
+            url.pop_back();
+
+        return url;
+    }
+
+    static std::filesystem::path path()
+    {
+        auto* home = std::getenv("HOME");
+        return std::filesystem::path(home != nullptr ? home : ".") / ".wim"
+               / "places.json";
+    }
+
+    void seedDefaults()
+    {
+        data.places = {{"GitHub", "https://github.com"},
+                       {"Gmail", "https://mail.google.com"},
+                       {"Linear", "https://linear.app"},
+                       {"Wikipedia", "https://www.wikipedia.org"}};
+    }
+
+    PlacesFile data;
 };
 
 struct BrowserView final : View
 {
     BrowserView()
     {
+        api.onSetQuery = [this](const std::string& text) { setPaletteQuery(text); };
+        api.onMoveSelection = [this](int delta) { movePaletteSelection(delta); };
+        api.onActivate = [this]
+        { Threads::callAsync([this] { activatePalette(); }); };
+        api.onChoose = [this](const GoItem& item)
+        {
+            auto chosen = item;
+            Threads::callAsync([this, chosen] { chooseItem(chosen); });
+        };
+        api.onCancel = [this] { Threads::callAsync([this] { cancelPalette(); }); };
+        api.onCloseItem = [this](const GoItem& item)
+        {
+            auto id = item.tabId;
+            Threads::callAsync([this, id] { closeTabById(id); });
+        };
+        api.onToggleBookmark = [this](const GoItem& item)
+        { toggleBookmark(item.title, item.url); };
+
+        transport.getBridge().use(api);
+
         addressBar.onSubmit([this](const std::string& text)
                             { navigateActive(text); });
         addressBar.onEscape = [this] { activeTab->view().focusContent(); };
-
-        switcher.onDismiss = [this] { hideSwitcher(); };
-        switcher.onTabChosen = [this](int index)
-        {
-            hideSwitcher();
-            switchTo(*tabs[index]);
-        };
-        switcher.onQuerySubmitted = [this](const std::string& query)
-        {
-            hideSwitcher();
-            openTab(searchURL(query));
-        };
 
         addChildren({addressBar});
         openTab(homePage);
@@ -274,21 +402,28 @@ struct BrowserView final : View
         if (activeTab != nullptr)
             activeTab->view().setBounds(contentBounds);
 
-        switcher.setBounds(getLocalBounds());
+        if (paletteOpen)
+            paletteWeb.setBounds(getLocalBounds());
     }
 
-    // --- Tabs ---------------------------------------------------------------
+    // --- Tabs -----------------------------------------------------------------
 
-    void openTab(const std::string& url)
+    Tab& createTab(const std::string& url)
     {
-        auto& tab = tabs.createNew(getWebViewOptions());
+        auto& tab = tabs.createNew(nextTabId++, getWebViewOptions());
         tab.view().addUserScript(vimiumScript);
         tab.view().addScriptMessageHandler(
             "wim", [this](const std::string& command) { handleCommand(command); });
 
         wireTab(tab);
         tab.view().loadURL(url);
-        switchTo(tab);
+        return tab;
+    }
+
+    void openTab(const std::string& url)
+    {
+        switchTo(createTab(url));
+        syncPalette();
     }
 
     // A page-initiated popup (target=_blank, window.open) adopted as a tab. It
@@ -297,9 +432,10 @@ struct BrowserView final : View
     // would collide on the shared user-content controller.
     void adoptPopup(EA::OwningPointer<WebView> popup)
     {
-        auto& tab = tabs.createNew(std::move(popup));
+        auto& tab = tabs.createNew(nextTabId++, std::move(popup));
         wireTab(tab);
         switchTo(tab);
+        syncPalette();
     }
 
     void wireTab(Tab& tab)
@@ -313,13 +449,19 @@ struct BrowserView final : View
 
             if (t == activeTab)
                 addressBar.setText(url);
+
+            syncPalette();
         };
 
-        view.onTitleChanged = [t](const std::string& title) { t->title = title; };
+        view.onTitleChanged = [this, t](const std::string& title)
+        {
+            t->title = title;
+            syncPalette();
+        };
 
         view.onNavigationFinished = [this, t](const std::string&)
         {
-            if (t == activeTab && !addressBar.hasFocus() && !switcherVisible)
+            if (t == activeTab && !addressBar.hasFocus() && !paletteOpen)
                 t->view().focusContent();
         };
 
@@ -346,10 +488,10 @@ struct BrowserView final : View
         tab.view().setBounds(contentBounds);
         addressBar.setText(tab.url);
 
-        if (switcherVisible)
+        if (paletteOpen)
         {
-            switcher.removeFromParent();
-            addSubview(switcher);
+            paletteWeb.removeFromParent();
+            addSubview(paletteWeb);
         }
         else
             tab.view().focusContent();
@@ -363,6 +505,12 @@ struct BrowserView final : View
             return;
 
         auto wasActive = tab == activeTab;
+
+        if (tab == originTab)
+            originTab = nullptr;
+
+        if (tab == previewTab)
+            previewTab = nullptr;
 
         if (wasActive)
         {
@@ -380,6 +528,33 @@ struct BrowserView final : View
 
         if (wasActive)
             switchTo(*tabs[std::min(index, tabs.size() - 1)]);
+
+        syncPalette();
+    }
+
+    void closeTabById(std::int64_t id)
+    {
+        if (auto* tab = findTab(id))
+            closeTab(tab);
+    }
+
+    Tab* findTab(std::int64_t id)
+    {
+        for (auto& tab: tabs)
+            if (tab->id == id)
+                return tab.get();
+
+        return nullptr;
+    }
+
+    bool hasTabWithURL(const std::string& normalizedUrl)
+    {
+        for (auto& tab: tabs)
+            if (tab.get() != previewTab
+                && PlacesStore::normalize(tab->url) == normalizedUrl)
+                return true;
+
+        return false;
     }
 
     void cycleTab(int direction)
@@ -393,29 +568,254 @@ struct BrowserView final : View
         switchTo(*tabs[next]);
     }
 
-    // --- Omnibar / commands ---------------------------------------------------
+    // --- Go palette -------------------------------------------------------------
 
-    void showSwitcher()
+    void showPalette()
     {
-        auto items = Vector<wim::TabSwitcher::Item> {};
+        if (paletteOpen)
+            return;
 
-        for (auto i = 0; i < tabs.size(); ++i)
-            items.push_back({tabs[i]->title, tabs[i]->url, i});
+        paletteOpen = true;
+        originTab = activeTab;
+        paletteQuery.clear();
+        paletteSelected = 0;
+        paletteTouched = false;
+        generation++;
+        syncPalette();
 
-        switcherVisible = true;
-        addSubview(switcher);
-        switcher.setBounds(getLocalBounds());
-        switcher.open(std::move(items));
+        addSubview(paletteWeb);
+        paletteWeb.setBounds(getLocalBounds());
+        paletteWeb.focusContent();
     }
 
-    void hideSwitcher()
+    void hidePalette()
     {
-        switcherVisible = false;
-        switcher.removeFromParent();
+        if (!paletteOpen)
+            return;
+
+        paletteOpen = false;
+        originTab = nullptr;
+        previewDirty = false;
+        paletteWeb.removeFromParent();
 
         if (activeTab != nullptr)
             activeTab->view().focusContent();
     }
+
+    void setPaletteQuery(const std::string& text)
+    {
+        if (!paletteOpen)
+            return;
+
+        paletteQuery = text;
+        paletteSelected = 0;
+        paletteTouched = true;
+        refilterPalette();
+        publishResults();
+        previewDirty = true;
+    }
+
+    void movePaletteSelection(int delta)
+    {
+        if (!paletteOpen || paletteFiltered.empty())
+            return;
+
+        paletteSelected =
+            std::clamp(paletteSelected + delta, 0, (int) paletteFiltered.size() - 1);
+        paletteTouched = true;
+        publishResults();
+        previewDirty = false;
+        previewSelected();
+    }
+
+    // Enter. A touched selection was already previewed (or is about to be) --
+    // apply it and dismiss. An untouched palette dismisses without moving.
+    void activatePalette()
+    {
+        if (!paletteOpen)
+            return;
+
+        if (paletteTouched && !paletteFiltered.empty())
+        {
+            previewSelected();
+            commitPalette();
+            return;
+        }
+
+        if (paletteFiltered.empty() && !paletteQuery.empty())
+        {
+            openQueryFromPalette(paletteQuery);
+            return;
+        }
+
+        commitPalette();
+    }
+
+    void chooseItem(const GoItem& item)
+    {
+        if (!paletteOpen)
+            return;
+
+        previewItem(item);
+        commitPalette();
+    }
+
+    void previewSelected()
+    {
+        if (!paletteOpen || !paletteTouched)
+            return;
+
+        if (paletteSelected < (int) paletteFiltered.size())
+            previewItem(paletteFiltered[(size_t) paletteSelected]);
+    }
+
+    // Typing debounce: setPaletteQuery only marks the preview dirty; this 8 Hz
+    // tick applies it, so a fast typist doesn't load a page per keystroke.
+    void handlePreviewTick()
+    {
+        if (!previewDirty)
+            return;
+
+        previewDirty = false;
+        previewSelected();
+    }
+
+    // Selection moved in the palette: change the page underneath right away,
+    // so Enter only dismisses. Saved places that aren't open are loaded into a
+    // single reused preview tab.
+    void previewItem(const GoItem& item)
+    {
+        if (!paletteOpen)
+            return;
+
+        if (item.tabId >= 0)
+        {
+            if (auto* tab = findTab(item.tabId))
+                switchTo(*tab);
+
+            return;
+        }
+
+        if (previewTab == nullptr)
+            previewTab = &createTab(item.url);
+        else
+            previewTab->view().loadURL(item.url);
+
+        switchTo(*previewTab);
+    }
+
+    void commitPalette()
+    {
+        if (previewTab != nullptr && previewTab != activeTab)
+            closeTab(previewTab);
+
+        previewTab = nullptr;
+        hidePalette();
+    }
+
+    void cancelPalette()
+    {
+        if (originTab != nullptr && originTab != activeTab)
+            switchTo(*originTab);
+
+        if (previewTab != nullptr)
+            closeTab(previewTab);
+
+        previewTab = nullptr;
+        hidePalette();
+    }
+
+    void openQueryFromPalette(const std::string& text)
+    {
+        auto url = searchURL(text);
+
+        if (previewTab != nullptr)
+        {
+            previewTab->view().loadURL(url);
+            switchTo(*previewTab);
+            previewTab = nullptr;
+        }
+        else
+            openTab(url);
+
+        hidePalette();
+    }
+
+    void toggleBookmark(const std::string& title, const std::string& url)
+    {
+        places.toggle(title, url);
+        syncPalette();
+    }
+
+    // Rebuild the merged tabs+places list, re-rank it against the current
+    // query, and push the render model. Called on every tab/place mutation so
+    // an open palette stays live.
+    void syncPalette()
+    {
+        rebuildPaletteItems();
+        refilterPalette();
+        publishResults();
+    }
+
+    void rebuildPaletteItems()
+    {
+        paletteAll.clear();
+
+        for (auto& tab: tabs)
+        {
+            if (tab.get() == previewTab)
+                continue;
+
+            paletteAll.push_back(
+                {tab->id,
+                 tab->title.empty() ? tab->url : tab->title,
+                 tab->url,
+                 places.contains(PlacesStore::normalize(tab->url))});
+        }
+
+        for (auto& place: places.data.places)
+            if (!hasTabWithURL(PlacesStore::normalize(place.url)))
+                paletteAll.push_back({-1, place.title, place.url, true});
+    }
+
+    void refilterPalette()
+    {
+        paletteFiltered.clear();
+
+        if (paletteQuery.empty())
+        {
+            paletteFiltered = paletteAll;
+        }
+        else
+        {
+            auto scored = std::vector<std::pair<int, const GoItem*>> {};
+
+            for (auto& item: paletteAll)
+            {
+                if (auto score =
+                        wim::fuzzyScore(paletteQuery, item.title + " " + item.url))
+                    scored.push_back({*score, &item});
+            }
+
+            std::stable_sort(scored.begin(),
+                             scored.end(),
+                             [](const auto& a, const auto& b)
+                             { return a.first > b.first; });
+
+            for (auto& [score, item]: scored)
+                paletteFiltered.push_back(*item);
+        }
+
+        auto last = std::max((int) paletteFiltered.size() - 1, 0);
+        paletteSelected = std::clamp(paletteSelected, 0, last);
+    }
+
+    void publishResults()
+    {
+        api.results.publish({paletteFiltered, paletteSelected, generation});
+    }
+
+    // --- Page commands ----------------------------------------------------------
 
     void handleCommand(const std::string& command)
     {
@@ -424,8 +824,13 @@ struct BrowserView final : View
             addressBar.setText("");
             addressBar.focus();
         }
-        else if (command == "openSwitcher")
-            showSwitcher();
+        else if (command == "openPalette")
+            showPalette();
+        else if (command == "toggleBookmark")
+        {
+            if (activeTab != nullptr)
+                toggleBookmark(activeTab->title, activeTab->url);
+        }
         else if (command == "closeTab")
             Threads::callAsync([this] { closeTab(activeTab); });
         else if (command == "nextTab")
@@ -496,19 +901,44 @@ struct BrowserView final : View
         return options;
     }
 
+    static WebView::Options paletteOptions()
+    {
+        auto options = embeddedOptions("WimGo");
+        options.transparentBackground = true;
+        return options;
+    }
+
     static constexpr auto homePage = "https://www.wikipedia.org";
 
+    Api::WimApi api;
     AddressBar addressBar {std::string(homePage)};
-    wim::TabSwitcher switcher;
+    PlacesStore places;
     EA::OwnedVector<Tab> tabs;
     Tab* activeTab = nullptr;
+    Tab* originTab = nullptr;
+    Tab* previewTab = nullptr;
+    std::int64_t nextTabId = 0;
+    std::int64_t generation = 0;
+    bool paletteOpen = false;
+    bool paletteTouched = false;
+    bool previewDirty = false;
+    int paletteSelected = 0;
+    std::string paletteQuery;
+    std::vector<GoItem> paletteAll;
+    std::vector<GoItem> paletteFiltered;
     Rect contentBounds;
-    bool switcherVisible = false;
+    WebView paletteWeb {paletteOptions()};
+    WebViewBridge transport {paletteWeb};
+    Threads::Timer previewTimer {[this] { handlePreviewTick(); }, 8};
 };
 
 struct WimApp
 {
-    WimApp() { window.setContentView(view); }
+    WimApp()
+    {
+        setApplicationMenuBar(buildDefaultWebViewMenuBar());
+        window.setContentView(view);
+    }
 
     static WindowOptions getOptions()
     {
