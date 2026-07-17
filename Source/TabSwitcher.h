@@ -126,10 +126,10 @@ struct TabSwitcher final : View
             }
 
             g.setColor(Color::white(0.95f));
-            g.drawText(truncated(item.title.empty() ? item.url : item.title,
-                                 row.w - 36.f),
-                       {row.x + 18.f, row.y + 19.f},
-                       titleFont);
+            g.drawText(
+                truncated(item.title.empty() ? item.url : item.title, row.w - 36.f),
+                {row.x + 18.f, row.y + 19.f},
+                titleFont);
 
             g.setColor(Color::gray(0.6f));
             g.drawText(truncated(item.url, row.w - 36.f),

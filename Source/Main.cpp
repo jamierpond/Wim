@@ -284,8 +284,7 @@ struct BrowserView final : View
         auto& tab = tabs.createNew(getWebViewOptions());
         tab.view().addUserScript(vimiumScript);
         tab.view().addScriptMessageHandler(
-            "wim",
-            [this](const std::string& command) { handleCommand(command); });
+            "wim", [this](const std::string& command) { handleCommand(command); });
 
         wireTab(tab);
         tab.view().loadURL(url);
@@ -316,8 +315,7 @@ struct BrowserView final : View
                 addressBar.setText(url);
         };
 
-        view.onTitleChanged = [t](const std::string& title)
-        { t->title = title; };
+        view.onTitleChanged = [t](const std::string& title) { t->title = title; };
 
         view.onNavigationFinished = [this, t](const std::string&)
         {
@@ -332,8 +330,7 @@ struct BrowserView final : View
             return true;
         };
 
-        view.onClose = [this, t]
-        { Threads::callAsync([this, t] { closeTab(t); }); };
+        view.onClose = [this, t] { Threads::callAsync([this, t] { closeTab(t); }); };
     }
 
     void switchTo(Tab& tab)
@@ -476,8 +473,8 @@ struct BrowserView final : View
 
         for (auto c: text)
         {
-            if (std::isalnum((unsigned char) c) || c == '-' || c == '_'
-                || c == '.' || c == '~')
+            if (std::isalnum((unsigned char) c) || c == '-' || c == '_' || c == '.'
+                || c == '~')
                 encoded += c;
             else if (c == ' ')
                 encoded += '+';
